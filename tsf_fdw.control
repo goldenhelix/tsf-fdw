@@ -1,0 +1,8 @@
+# tsf_fdw extension
+#
+# Copyright (c) 2015 Golden Helix, Inc.
+#
+comment = 'foreign data wrapper for TSF files provided by Golden Helix'
+default_version = '1.0'
+module_pathname = '$libdir/tsf_fdw'
+relocatable = true

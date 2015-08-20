@@ -23,7 +23,7 @@ TSF_OBJS = $(TSF_PATH)/tsf.os \
 	$(TSF_PATH)/blosc/blosclz.o \
 	$(TSF_PATH)/blosc/shuffle.o
 
-PG_CPPFLAGS = --std=c99 -I$(TSF_PATH) -I$(TSF_PATH)/jansson -I$(TSF_PATH)/blosc
+PG_CPPFLAGS = --std=c99 -ggdb -I$(TSF_PATH) -I$(TSF_PATH)/jansson -I$(TSF_PATH)/blosc
 SHLIB_LINK = -lz
 OBJS = tsf_fdw.o $(TSF_OBJS)
 

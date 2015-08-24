@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 
 #include "tsf.h"
+#include "stringbuilder.h"
 
 #include "access/reloptions.h"
 #include "catalog/pg_type.h"
@@ -117,6 +118,105 @@ static Datum ColumnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId);
 
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
+
+#define GET_STR(textp) DatumGetCString(DirectFunctionCall1(textout, PointerGetDatum(textp)))
+#define GET_TEXT(cstrp) DatumGetTextP(DirectFunctionCall1(textin, CStringGetDatum(cstrp)))
+
+PG_FUNCTION_INFO_V1(tsf_generate_schemas);
+
+static const char* psql_type(tsf_value_type type)
+{
+  switch(type) {
+    case TypeInt32: return "integer";
+    case TypeInt64: return "bigint";
+    case TypeFloat32: return "real";
+    case TypeFloat64: return "double precision";
+    case TypeBool: return "boolean";
+    case TypeString: return "text";
+    case TypeEnum: return "text";
+    case TypeInt32Array: return "integer[]";
+    case TypeFloat32Array: return "real[]";
+    case TypeFloat64Array: return "double precision[]";
+    case TypeBoolArray: return "boolean[]";
+    case TypeStringArray: return "text[]";
+    case TypeEnumArray: return "text[]";
+    case TypeUnkown: return "";
+  }
+}
+
+static void create_table_schema(stringbuilder *str, const char *prefix, const char *fileName,
+                                int sourceId, tsf_source *s, tsf_field_type fieldType,
+                                const char *tableSuffix)
+{
+  char *buf = 0;
+
+  // Locus attr field table
+  bool foundOne = false;
+  for (int i = 0; i < s->field_count; i++) {
+    if (s->fields[i].field_type == fieldType) {
+      if (!foundOne) {
+        foundOne = true;
+        if (str->pos > 0)  // Add double space between consecutive statements
+          sb_append_str(str, "\n");
+
+        asprintf(&buf, "CREATE FOREIGN TABLE %s_%d%s (\n       _id integer", prefix, sourceId,
+                 tableSuffix);
+        sb_append_str(str, buf);
+        free(buf);
+        if (fieldType == FieldMatrix)
+          sb_append_str(str, ",\n       _entity_id integer");
+      }
+      asprintf(&buf, ",\n       %s %s", s->fields[i].symbol, psql_type(s->fields[i].value_type));
+      sb_append_str(str, buf);
+      free(buf);
+    }
+  }
+  if (foundOne) {
+    sb_append_str(str, "\n       )\n       SERVER tsf_server\n");
+    asprintf(&buf, "       OPTIONS (filename '%s', sourceid '%d');\n", fileName, sourceId);
+    sb_append_str(str, buf);
+    free(buf);
+  }
+}
+
+/*
+ * tsf_generate_schemas is a user-facing helper function to generate
+ * CREATE FOREIGN TABLE schemas for all sources in a TSF.
+ */
+Datum tsf_generate_schemas(PG_FUNCTION_ARGS)
+{
+  text *prefixText = PG_GETARG_TEXT_P(0);
+  text *fileNameText = PG_GETARG_TEXT_P(1);
+  const char *prefix = GET_STR(prefixText);
+  const char *fileName = GET_STR(fileNameText);
+  int sourceId = PG_GETARG_INT32(2);
+
+  tsf_file *tsf = tsf_open_file(fileName);
+  if (tsf->errmsg != NULL) {
+    ereport(ERROR,
+            (errmsg("could not open to %s", fileName),
+             errhint("TSF driver connection error: %s", tsf->errmsg)));
+  }
+
+  stringbuilder* str = sb_new();
+
+  for(int id = sourceId <= 0 ? 1 : sourceId;
+      id < (sourceId <= 0 ? tsf->source_count + 1 : sourceId + 1);
+      id++)
+  {
+    tsf_source* s = &tsf->sources[id - 1];
+    create_table_schema(str, prefix, fileName, id, s, FieldLocusAttribute, "");
+    create_table_schema(str, prefix, fileName, id, s, FieldMatrix, "_matrix");
+    create_table_schema(str, prefix, fileName, id, s, FieldEntityAttribute, "_entity");
+
+  }
+  text* ret = GET_TEXT(sb_cstring(str));
+  sb_destroy(str, true);
+  tsf_close_file(tsf);
+
+  PG_RETURN_TEXT_P(ret);
+}
+
 
 PG_FUNCTION_INFO_V1(tsf_fdw_handler);
 PG_FUNCTION_INFO_V1(tsf_fdw_validator);
@@ -261,6 +361,21 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   add_path(baserel, foreignScanPath);
 }
 
+static bool isInternableExpr(PlannerInfo *root, RelOptInfo *baserel,
+                             Expr *clause, Expr **outToTsf)
+{
+  // TODO: check if clause is a expression that TSF can handle internally.
+  // For example:
+  // tsf_variable = sub_expression
+  //
+  // I this case, we pass back sub_expression in outToTsf so the execute
+  // will prepare it for execution and we can read then its value in
+  // ForeignScan function.
+  //
+  // Special case when tsf_variable is "_id";
+  return false; // Not yet implemented
+}
+
 /*
  * TsfGetForeignPlan creates a foreign scan plan node for scanning the
  * TSF table. We also add the query column list to scan nodes private
@@ -272,17 +387,31 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                                       List *targetList, List *scanClauses) {
   Index scanRangeTableIndex = baserel->relid;
   ForeignScan *foreignScan = NULL;
+  ListCell *lc = NULL;
   List *columnList = NIL;
   List *foreignPrivateList = NIL;
+  List *localExprs = NIL;
+  List *tsfExprs = NIL;
+  Expr *tsfExpr = NULL;
 
   /*
-   * Although we skip row blocks that are refuted by the WHERE clause, but
-   * we have no native ability to evaluate restriction clauses and make sure
-   * that all non-related rows are filtered out. So we just put all of the
-   * scanClauses into the plan node's qual list for the executor to check.
+   * Separate the scan_clauses into those that can be executed
+   * internally and those that can't.
    */
-  scanClauses =
-      extract_actual_clauses(scanClauses, false); /* extract regular clauses */
+  foreach (lc, scanClauses) {
+    RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
+
+    Assert(IsA(rinfo, RestrictInfo));
+
+    /* Ignore any pseudoconstants, they're dealt with elsewhere */
+    if (rinfo->pseudoconstant)
+      continue;
+
+    if (isInternableExpr(root, baserel, rinfo->clause, &tsfExpr))
+      tsfExprs = lappend(tsfExprs, tsfExpr);
+    else
+      localExprs = lappend(localExprs, rinfo->clause);
+  }
 
   /*
    * As an optimization, we only read columns that are present in the query.
@@ -293,19 +422,10 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
   columnList = ColumnList(baserel);
   foreignPrivateList = list_make1(columnList);
 
-  // TODO: We *want* to evaluate some conditions natively.
-  //
-  // Especially ID lookups (i.e. ID == N, which we can do in O(1)).
-  //
-  // Also, where we have a genomic index:
-  //   WHERE chr == 'X' AND start >= I AND stop <= J
-  //
-  // In which case we would need to parse RestrictInfo and add
-  // expression to evaluate. See mysql_fdw for example.
 
   /* create the foreign scan node */
-  foreignScan = make_foreignscan(targetList, scanClauses, scanRangeTableIndex,
-                                 NIL, /* no expressions to evaluate */
+  foreignScan = make_foreignscan(targetList, localExprs, scanRangeTableIndex,
+                                 tsfExprs,
                                  foreignPrivateList);
   return foreignScan;
 }
@@ -455,6 +575,8 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   for (int i = 0; i < executionState->columnCount; i++)
     fields[i] = executionState->columnMapping[i].tsfIdx;
 
+  // Evalue expressions in fdw_exprs
+  
   // TODO: may look at relations that define entity contraints for matrix
   // tables
   // (i.e. entity_idx = 1 OR entity_idx = 2 would be a [1,2] param)

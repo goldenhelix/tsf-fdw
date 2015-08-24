@@ -60,6 +60,7 @@ typedef struct TsfFdwOptions {
 } TsfFdwOptions;
 
 /* Function declarations for foreign data wrapper */
+extern Datum tsf_generate_schemas(PG_FUNCTION_ARGS);
 extern Datum tsf_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum tsf_fdw_validator(PG_FUNCTION_ARGS);
 

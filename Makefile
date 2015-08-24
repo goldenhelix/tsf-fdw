@@ -25,7 +25,7 @@ TSF_OBJS = $(TSF_PATH)/tsf.os \
 
 PG_CPPFLAGS = --std=c99 -ggdb -I$(TSF_PATH) -I$(TSF_PATH)/jansson -I$(TSF_PATH)/blosc
 SHLIB_LINK = -lz
-OBJS = tsf_fdw.o $(TSF_OBJS)
+OBJS = tsf_fdw.o stringbuilder.o $(TSF_OBJS)
 
 EXTENSION = tsf_fdw
 DATA = tsf_fdw--1.0.sql

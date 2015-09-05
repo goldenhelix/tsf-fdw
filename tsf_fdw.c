@@ -486,7 +486,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
       }
     } else {
       // Wasn't able to extract these restrictions...
-      elog(INFO, "Exracted %d quals", list_length(quals));
+      //elog(INFO, "Exracted %d quals", list_length(quals));
       localExprs = lappend(localExprs, rinfo->clause);
     }
   }
@@ -780,11 +780,9 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
 
   if (state->idList) {
     for(int i=0; i<state->idListCount; i++)
-      elog(INFO, "%d %p: idList[%d] = %d",  state->idListIdx, state->idList, i, state->idList[i]);
     // Special iteration if we are doing ID lookups
     if (state->idListIdx < state->idListCount &&
         tsf_iter_id(state->iter, state->idList[state->idListIdx++])) {
-      elog(INFO, "idList[%d] = %d",  state->idListIdx-1, state->idList[state->idListIdx-1]);
       FillTupleSlot(state->iter, state->columnMapping, columnValues, columnNulls, state->idColumnIndex);
       ExecStoreVirtualTuple(tupleSlot);
     }

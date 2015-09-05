@@ -5,9 +5,15 @@
  * Function definitions for TSF foreign data wrapper. These functions access
  * data stored in TSF through the official C driver.
  *
- * Credit: This FDW heavily leaned on the mongo_fdw
+ * Credit:
+ *
+ * This FDW heavily leaned on the mongo_fdw
  * [https://github.com/citusdata/mongo_fdw] as an implementation
  * guide. Thanks to Citus Data for making their FDW open source.
+ *
+ * Also, the restriction parsing and evaluation is heavily modeled after
+ * the Python FDW module Multicorn libary by Kozea
+ * [https://github.com/Kozea/Multicorn/]
  *
  * Copyright (c) 2015 Golden Helix, Inc.
  *
@@ -21,6 +27,7 @@
 
 #include "tsf.h"
 #include "stringbuilder.h"
+#include "query.h"
 
 #include "access/reloptions.h"
 #include "catalog/pg_type.h"
@@ -36,13 +43,15 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
+#include "parser/parsetree.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
 
 #if PG_VERSION_NUM >= 90300
 #include "access/htup_details.h"
@@ -79,12 +88,31 @@ typedef struct TsfFdwExecState
   int idColumnIndex;
   int columnCount;
   struct ColumnMapping *columnMapping;
+
+  int sourceId;
   tsf_file *tsf;
   tsf_iter* iter;
 
+  List	   *qualList;
+
+  // iter to be driven by a specific set of IDs
+  int idListIdx;
+  int *idList;
+  int idListCount;
+
+  // Parsed out of qualList is restriciton info
 } TsfFdwExecState;
 
-
+// case insenstive string comapre
+static int stricmp(char const *a, char const *b)
+{
+  for (;; a++, b++) {
+    int d = tolower(*a) - tolower(*b);
+    if (d != 0 || !*a)
+      return d;
+  }
+  return -1; //should never be reached
+}
 
 /* Local functions forward declarations */
 static StringInfo OptionNamesString(Oid currentContextId);
@@ -323,9 +351,27 @@ static StringInfo OptionNamesString(Oid currentContextId) {
  */
 static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                  Oid foreignTableId) {
-  elog(DEBUG1, "entering function %s", __func__);
-  // TODO: We could open a file and get this data. But seems like then we
-  // should leave the TSF open all the time, maybe attach to baserel
+  //elog(INFO, "entering function %s", __func__);
+
+  // TODO: use extractRestrictions and id checks to have different estimates
+
+  List *rowClauseList = baserel->baserestrictinfo;
+  double rowSelectivity = clauselist_selectivity(root, rowClauseList, 0, JOIN_INNER, NULL);
+
+  TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
+  tsf_file *tsf = tsf_open_file(tsfFdwOptions->filename);
+  if (tsf->errmsg != NULL) {
+    ereport(ERROR,
+            (errmsg("could not open to %s:%d", tsfFdwOptions->filename, tsfFdwOptions->sourceId),
+             errhint("TSF driver connection error: %s", tsf->errmsg)));
+  }
+  Assert(tsfFdwOptions->sourceId <= tsf->source_count);
+  tsf_source *tsfSource = &tsf->sources[tsfFdwOptions->sourceId - 1];
+  int rowCount = tsfSource->fields[0].field_type == FieldEntityAttribute ? tsfSource->entity_count
+                                                                        : tsfSource->locus_count;
+  tsf_close_file(tsf);
+  double outputRowCount = clamp_row_est(rowCount * rowSelectivity);
+  baserel->rows = outputRowCount;
 }
 
 /*
@@ -336,7 +382,12 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
  */
 static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
                                Oid foreignTableId) {
+  //elog(INFO, "entering function %s", __func__);
   Path *foreignScanPath = NULL;
+
+  // TODO: Use the findPaths methdo from multiCorn, adding the tuple
+  // ("_id", 1) and when appropriae ("_enitty_id", _rowCount)
+
   /*
    * We skip reading columns that are not in query. Here we assume that all
    * columns in relation have the same width.
@@ -346,7 +397,6 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   Cost startupCost = 10;
   Cost totalCost = (baserel->rows * queryColumnCount) + startupCost;
 
-  // TODO: Could do some estimates of filtering effect on rows
 
   // TODO: We can gurantee ordering by ID, so should set 'pathkeys'
   // appropriately
@@ -354,25 +404,33 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   /* create a foreign path node and add it as the only possible path */
   foreignScanPath =
       (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
-                                      totalCost, NIL, /* no known ordering */
+                                      totalCost,
+                                      NIL, /* no known ordering */
                                       NULL,           /* not parameterized */
                                       NIL);           /* no fdw_private */
 
   add_path(baserel, foreignScanPath);
 }
 
-static bool isInternableExpr(PlannerInfo *root, RelOptInfo *baserel,
-                             Expr *clause, Expr **outToTsf)
+static bool isIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
+  char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
+
+  if (stricmp(columnName, "_id") == 0 &&
+          strcmp(qual->opname, "=") == 0)
+  {
+    // Scalar or useOr
+    return !qual->isArray || qual->useOr;
+  }
+  return false;
+}
+
+static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
+{
+  char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
   // TODO: check if clause is a expression that TSF can handle internally.
   // For example:
-  // tsf_variable = sub_expression
-  //
-  // I this case, we pass back sub_expression in outToTsf so the execute
-  // will prepare it for execution and we can read then its value in
-  // ForeignScan function.
-  //
-  // Special case when tsf_variable is "_id";
+  // tsf_variable <supported_operator> sub_expression
   return false; // Not yet implemented
 }
 
@@ -392,12 +450,13 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
   List *foreignPrivateList = NIL;
   List *localExprs = NIL;
   List *tsfExprs = NIL;
-  Expr *tsfExpr = NULL;
 
+  //elog(INFO, "entering function %s", __func__);
   /*
    * Separate the scan_clauses into those that can be executed
    * internally and those that can't.
    */
+  bool foundIdRestriction = false;
   foreach (lc, scanClauses) {
     RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
 
@@ -407,10 +466,29 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
     if (rinfo->pseudoconstant)
       continue;
 
-    if (isInternableExpr(root, baserel, rinfo->clause, &tsfExpr))
-      tsfExprs = lappend(tsfExprs, tsfExpr);
-    else
+    List *quals = NIL;
+    extractRestrictions(baserel->relids, rinfo->clause, &quals);
+
+    if(list_length(quals) == 1) {
+      MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
+      // ID restrictions must be only internalized expressions if they
+      // are found. Otherwise we can have any number of internalizable
+      // restriction expressions.
+      if (!tsfExprs &&
+          isIdRestriction(foreignTableId, qual)) {
+        tsfExprs = lappend(tsfExprs, rinfo->clause);
+        foundIdRestriction = true;
+      } else if (!foundIdRestriction &&
+                 isInternableRestriction(foreignTableId, qual)) {
+        tsfExprs = lappend(tsfExprs, rinfo->clause);
+      } else {
+        localExprs = lappend(localExprs, rinfo->clause); //We don't hanle
+      }
+    } else {
+      // Wasn't able to extract these restrictions...
+      elog(INFO, "Exracted %d quals", list_length(quals));
       localExprs = lappend(localExprs, rinfo->clause);
+    }
   }
 
   /*
@@ -424,7 +502,9 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 
 
   /* create the foreign scan node */
-  foreignScan = make_foreignscan(targetList, localExprs, scanRangeTableIndex,
+  foreignScan = make_foreignscan(targetList,
+                                 localExprs, /* postgres will run these restrictions on results */
+                                 scanRangeTableIndex,
                                  tsfExprs,
                                  foreignPrivateList);
   return foreignScan;
@@ -537,21 +617,10 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
     return;
   }
 
+  Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
+  TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
 
-
-  Oid foreignTableId = InvalidOid;
-  TsfFdwOptions *tsfFdwOptions = NULL;
-
-  tsf_file *tsf = NULL;
-  tsf_iter* iter = NULL;
-
-  List *columnList = NIL;
-  TsfFdwExecState *executionState = NULL;
-
-  foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
-  tsfFdwOptions = TsfGetOptions(foreignTableId);
-
-  tsf = tsf_open_file(tsfFdwOptions->filename);
+  tsf_file *tsf = tsf_open_file(tsfFdwOptions->filename);
   if(tsf->errmsg != NULL) {
     ereport(ERROR,
             (errmsg("could not open to %s:%d", tsfFdwOptions->filename,
@@ -564,34 +633,105 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
 
   /* create column mapping */
   ForeignScan* foreignScan = (ForeignScan *)scanState->ss.ps.plan;
+
   List* foreignPrivateList = foreignScan->fdw_private;
   Assert(list_length(foreignPrivateList) == 1);
 
-  columnList = (List *)linitial(foreignPrivateList);
-
-  executionState = (TsfFdwExecState *)palloc0(sizeof(TsfFdwExecState));
-  BuildColumnMapping(foreignTableId, columnList, tsfSource, executionState);
-  int* fields = calloc(sizeof(int), executionState->columnCount);
-  for (int i = 0; i < executionState->columnCount; i++)
-    fields[i] = executionState->columnMapping[i].tsfIdx;
-
-  // Evalue expressions in fdw_exprs
-  
-  // TODO: may look at relations that define entity contraints for matrix
-  // tables
-  // (i.e. entity_idx = 1 OR entity_idx = 2 would be a [1,2] param)
-  iter = tsf_query_table(tsf, tsfFdwOptions->sourceId, executionState->columnCount, fields, -1, NULL);
-  free(fields);
-  if(!iter){
-      ereport(ERROR, (errmsg("Failed to start TSF table query"),
-                      errhint("Query failed on %d fields", executionState->columnCount)) );
-  }
+  List *columnList = (List *)linitial(foreignPrivateList);
 
   /* create and set foreign execution state */
+  TsfFdwExecState *executionState = (TsfFdwExecState *)palloc0(sizeof(TsfFdwExecState));
+  BuildColumnMapping(foreignTableId, columnList, tsfSource, executionState);
+
+  /* We extract the qual list, but execute it one first iteration through ForeingScan */
+  executionState->qualList = NULL;
+
+  List* foreignExprs = foreignScan->fdw_exprs;
+  ListCell *lc = NULL;
+  foreach(lc, foreignExprs)
+  {
+    extractRestrictions(bms_make_singleton(foreignScan->scan.scanrelid),
+                        ((Expr *) lfirst(lc)),
+                        &executionState->qualList);
+  }
+
   executionState->tsf = tsf;
-  executionState->iter = iter;
+  executionState->sourceId = tsfFdwOptions->sourceId;
+  executionState->iter = NULL;
 
   scanState->fdw_state = (void *)executionState;
+}
+
+static void executeQualList(ForeignScanState *scanState)
+{
+  TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
+  ListCell   *lc;
+
+  ExprContext *econtext = scanState->ss.ps.ps_ExprContext;
+
+  foreach(lc, state->qualList)
+  {
+    MulticornBaseQual *qual = lfirst(lc);
+    MulticornConstQual *newqual = NULL;
+    bool		isNull;
+    ExprState  *expr_state = NULL;
+
+    switch (qual->right_type) {
+      case T_Param:
+        expr_state = ExecInitExpr(((MulticornParamQual *)qual)->expr, (PlanState *)scanState);
+        newqual = palloc0(sizeof(MulticornConstQual));
+        newqual->base.right_type = T_Const;
+        newqual->base.varattno = qual->varattno;
+        newqual->base.opname = qual->opname;
+        newqual->base.isArray = qual->isArray;
+        newqual->base.useOr = qual->useOr;
+        newqual->value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
+        newqual->base.typeoid = qual->typeoid;
+        newqual->isnull = isNull;
+        break;
+      case T_Const:
+        newqual = (MulticornConstQual *)qual;
+        break;
+      default:
+        break;
+    }
+    if (newqual != NULL) {
+      // Process const qual into TSF based query state manager.
+      // Special case for _id and _entity_id
+      if (state->idColumnIndex >= 0 &&
+          newqual->base.varattno - 1 == state->idColumnIndex) {
+        // _id qual
+        state->idListIdx = 0;
+        if(newqual->isnull){
+          state->idList = (void*)1; // non null
+          state->idListCount = 0;
+        }else if(!newqual->isnull && newqual->base.isArray ) {
+          ArrayType* array = DatumGetArrayTypeP(newqual->value);
+          Oid elmtype = ARR_ELEMTYPE(array);
+          Datum *dvalues;
+          bool *dnulls;
+          int nelems;
+          int16 elmlen;
+          bool elmbyval;
+          char elmalign;
+          get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+          deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign,
+                            &dvalues, &dnulls, &nelems);
+          state->idList = calloc(sizeof(int), nelems);
+          state->idListCount = 0;
+          for(int i=0; i<nelems; i++) {
+            if (!dnulls[i])
+              state->idList[state->idListCount++] = DatumGetInt32(dvalues[i]);
+          }
+        }else{
+          state->idList = calloc(sizeof(int), 1);
+          state->idListCount = 1;
+          // assert type?
+          state->idList[0] = DatumGetInt32(newqual->value);
+        }
+      }
+    }
+  }
 }
 
 /*
@@ -600,8 +740,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
  * a virtual tuple.
  */
 static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
-  TsfFdwExecState *executionState = (TsfFdwExecState *)scanState->fdw_state;
-  tsf_iter* iter = executionState->iter;
+  TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
   TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
@@ -616,19 +755,55 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
    * an empty slot as required.
    */
   ExecClearTuple(tupleSlot);
-
-  /* initialize all values for this row to null */
   memset(columnValues, 0, columnCount * sizeof(Datum));
   memset(columnNulls, true, columnCount * sizeof(bool));
 
-  if (tsf_iter_next(iter)) {
-    FillTupleSlot(iter, executionState->columnMapping, columnValues, columnNulls,
-                  executionState->idColumnIndex);
+  if (!state->iter) {
+    /* initialize all values for this row to null */
 
-    ExecStoreVirtualTuple(tupleSlot);
-  } else {
-    // Do nothing, tuple slot is empty
+    // Evalue expressions we extracted in qualList
+    executeQualList(scanState);
+
+    // TODO: executeQualList will set state->entityIdxList,
+    // state->entityIdxCount;
+    int *fields = calloc(sizeof(int), state->columnCount);
+    for (int i = 0; i < state->columnCount; i++)
+      fields[i] = state->columnMapping[i].tsfIdx;
+    state->iter =
+        tsf_query_table(state->tsf, state->sourceId, state->columnCount, fields, -1, NULL);
+    free(fields);
+    if (!state->iter) {
+      ereport(ERROR, (errmsg("Failed to start TSF table query"),
+                      errhint("Query failed on %d fields", state->columnCount)));
+    }
   }
+
+  if (state->idList) {
+    for(int i=0; i<state->idListCount; i++)
+      elog(INFO, "%d %p: idList[%d] = %d",  state->idListIdx, state->idList, i, state->idList[i]);
+    // Special iteration if we are doing ID lookups
+    if (state->idListIdx < state->idListCount &&
+        tsf_iter_id(state->iter, state->idList[state->idListIdx++])) {
+      elog(INFO, "idList[%d] = %d",  state->idListIdx-1, state->idList[state->idListIdx-1]);
+      FillTupleSlot(state->iter, state->columnMapping, columnValues, columnNulls, state->idColumnIndex);
+      ExecStoreVirtualTuple(tupleSlot);
+    }
+  } else {
+    // TODO: Have special iteration mode with quals:
+    // - One table iterator per qual. For each condition, advance one, do
+    // - condition test. If true, do second test with ID iterator. Short
+    // - circut if fail. (i.e if first condition does most filtering,
+    // - most other filters are not run).
+    // - still need to learn how OR compound statements work at this level
+
+    if (tsf_iter_next(state->iter)) {
+      FillTupleSlot(state->iter, state->columnMapping, columnValues, columnNulls, state->idColumnIndex);
+      ExecStoreVirtualTuple(tupleSlot);
+    }
+  }
+
+  // Note if not iter succeeded, then the cleared slot is a sentinal to
+  // stop iteration.
 
   return tupleSlot;
 }
@@ -638,12 +813,13 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
  * and the connection to TSF, and reclaims scan related resources.
  */
 static void TsfEndForeignScan(ForeignScanState *scanState) {
-  TsfFdwExecState *executionState = (TsfFdwExecState *)scanState->fdw_state;
+  TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   /* if we executed a query, reclaim tsf related resources */
-  if (executionState != NULL) {
-    tsf_iter_close(executionState->iter);
-    tsf_close_file(executionState->tsf);
+  if (state != NULL) {
+    tsf_iter_close(state->iter);
+    tsf_close_file(state->tsf);
+    free(state->idList);
   }
 }
 
@@ -654,21 +830,21 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
 static void TsfReScanForeignScan(ForeignScanState *scanState) {
   elog(DEBUG1, "entering function %s", __func__);
 
-  TsfFdwExecState *executionState = (TsfFdwExecState *)scanState->fdw_state;
-  tsf_iter* iter = executionState->iter;
+  TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
+  tsf_iter* iter = state->iter;
 
-  int fieldCount = executionState->columnCount;
+  int fieldCount = state->columnCount;
   int* fields = calloc(sizeof(int), fieldCount);
-  for (int i = 0; i < executionState->columnCount; i++)
-    fields[i] = executionState->columnMapping[i].tsfIdx;
+  for (int i = 0; i < state->columnCount; i++)
+    fields[i] = state->columnMapping[i].tsfIdx;
 
   // New iter
-  tsf_iter* new_iter = tsf_query_table(executionState->tsf, iter->source_id, fieldCount, fields, -1, NULL);
+  tsf_iter* new_iter = tsf_query_table(state->tsf, iter->source_id, fieldCount, fields, -1, NULL);
   free(fields);
 
   tsf_iter_close(iter);
 
-  executionState->iter = new_iter;
+  state->iter = new_iter;
 }
 
 /*
@@ -724,21 +900,11 @@ static char *TsfGetOptionValue(Oid foreignTableId, const char *optionName) {
   return optionValue;
 }
 
-// case insenstive string comapre
-static int stricmp(char const *a, char const *b)
-{
-  for (;; a++, b++) {
-    int d = tolower(*a) - tolower(*b);
-    if (d != 0 || !*a)
-      return d;
-  }
-  return -1; //should never be reached
-}
-
 /*
- * ColumnMappingHash creates a hash table that maps column names to column index
- * and types. This table helps us quickly translate BSON document key/values to
- * the corresponding PostgreSQL columns.
+ * BuildColumnMapping pingHash creates a array of ColumnMapping objects
+ * the length of observed column variables (in columnList). Each mapping
+ * has the index into the values/nulls array it should fill the tuple
+ * (note this is varattno - 1).
  */
 static void BuildColumnMapping(Oid foreignTableId, List *columnList, tsf_source *tsfSource,
                                TsfFdwExecState *executionState)

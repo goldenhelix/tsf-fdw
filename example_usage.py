@@ -1,3 +1,4 @@
+from __future__ import print_function
 import psycopg2
 
 import argparse
@@ -28,4 +29,5 @@ except:
 cur.execute("select tsf_generate_schemas('%s', '%s');" % ( args.prefix, args.filename) )
 r = cur.fetchall()[0][0]
 cur.execute(r)
+print(r)
 

@@ -365,7 +365,12 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
             (errmsg("could not open to %s:%d", tsfFdwOptions->filename, tsfFdwOptions->sourceId),
              errhint("TSF driver connection error: %s", tsf->errmsg)));
   }
-  Assert(tsfFdwOptions->sourceId <= tsf->source_count);
+  if(tsfFdwOptions->sourceId < 1 ||
+     tsfFdwOptions->sourceId > tsf->source_count) {
+    ereport(ERROR,
+            (errmsg("Invalid source id %s:%d", tsfFdwOptions->filename, tsfFdwOptions->sourceId),
+             errhint("There are %d sources in the TSF", tsf->source_count)));
+  }
   tsf_source *tsfSource = &tsf->sources[tsfFdwOptions->sourceId - 1];
   int rowCount = tsfSource->fields[0].field_type == FieldEntityAttribute ? tsfSource->entity_count
                                                                         : tsfSource->locus_count;

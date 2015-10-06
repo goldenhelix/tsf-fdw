@@ -643,7 +643,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY) {
     return;
   }
-  elog(INFO, "entering function %s", __func__);
+  //elog(INFO, "entering function %s", __func__);
 
   Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
   TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
@@ -861,7 +861,7 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   /* if we executed a query, reclaim tsf related resources */
-  elog(INFO, "entering function %s", __func__);
+  //elog(INFO, "entering function %s", __func__);
   if (state != NULL) {
     tsf_iter_close(state->iter);
     tsf_close_file(state->tsf);
@@ -876,14 +876,14 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
  * Note: from tracing, it looks like TsfBeginForeignScan is always called before this.
  */
 static void TsfReScanForeignScan(ForeignScanState *scanState) {
-  elog(INFO, "entering function %s", __func__);
+  //elog(INFO, "entering function %s", __func__);
 
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
   if(state->iter) {
     // This happens on inner loops, where the conditional values is
     // re-bound and we clear the iterator here and it gets picked up in
     // the first ForeignScan with a NULL error.
-    elog(INFO, "ReScan clearing iter state %s", __func__);
+    //elog(INFO, "ReScan clearing iter state %s", __func__);
     tsf_iter_close(state->iter);
     state->iter = NULL;
   }

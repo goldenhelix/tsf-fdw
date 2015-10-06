@@ -86,6 +86,7 @@ typedef struct ColumnMapping
 typedef struct TsfFdwExecState
 {
   int idColumnIndex;
+  int entityIdColumnIndex;
   int columnCount;
   struct ColumnMapping *columnMapping;
 
@@ -99,6 +100,10 @@ typedef struct TsfFdwExecState
   int idListIdx;
   int *idList;
   int idListCount;
+
+  // Used to set up matrix field query
+  int *entityIdList;
+  int entityIdListCount;
 
   // Parsed out of qualList is restriciton info
 } TsfFdwExecState;
@@ -139,8 +144,7 @@ static char *TsfGetOptionValue(Oid foreignTableId, const char *optionName);
 static void BuildColumnMapping(Oid foreignTableId, List *columnList, tsf_source *tsfSource,
                                TsfFdwExecState *executionState);
 
-static void FillTupleSlot(tsf_iter *iter, ColumnMapping *columnMappings, Datum *columnValues,
-                          bool *columnNulls, int32 idColumnIndex);
+static void  FillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *columnNulls);
 static Datum ColumnValue(tsf_v value, tsf_field *f, Oid columnTypeId);
 static Datum ColumnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId);
 
@@ -430,6 +434,19 @@ static bool isIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
   return false;
 }
 
+static bool isEntityIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
+{
+  char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
+
+  if (stricmp(columnName, "_entity_id") == 0 &&
+          strcmp(qual->opname, "=") == 0)
+  {
+    // Scalar or useOr
+    return !qual->isArray || qual->useOr;
+  }
+  return false;
+}
+
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
@@ -455,6 +472,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
   List *foreignPrivateList = NIL;
   List *localExprs = NIL;
   List *tsfExprs = NIL;
+  Expr *entityIdClause = NULL;
 
   //elog(INFO, "entering function %s", __func__);
   /*
@@ -483,6 +501,8 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
           isIdRestriction(foreignTableId, qual)) {
         tsfExprs = lappend(tsfExprs, rinfo->clause);
         foundIdRestriction = true;
+      } else if (isEntityIdRestriction(foreignTableId, qual)) {
+        entityIdClause = rinfo->clause; // Compatible with ID restrictions, so don't set tsfExprs
       } else if (!foundIdRestriction &&
                  isInternableRestriction(foreignTableId, qual)) {
         tsfExprs = lappend(tsfExprs, rinfo->clause);
@@ -495,6 +515,8 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
       localExprs = lappend(localExprs, rinfo->clause);
     }
   }
+  if(entityIdClause)
+    tsfExprs = lappend(tsfExprs, entityIdClause);
 
   /*
    * As an optimization, we only read columns that are present in the query.
@@ -621,6 +643,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY) {
     return;
   }
+  elog(INFO, "entering function %s", __func__);
 
   Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
   TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
@@ -667,6 +690,37 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   scanState->fdw_state = (void *)executionState;
 }
 
+static void parseQualIntoIdList(int** idList, int* idListCount, MulticornConstQual* newqual)
+{
+  if(newqual->isnull){
+    *idList = (void*)1; // non null
+    *idListCount = 0;
+  }else if(!newqual->isnull && newqual->base.isArray ) {
+    ArrayType* array = DatumGetArrayTypeP(newqual->value);
+    Oid elmtype = ARR_ELEMTYPE(array);
+    Datum *dvalues;
+    bool *dnulls;
+    int nelems;
+    int16 elmlen;
+    bool elmbyval;
+    char elmalign;
+    get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+    deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign,
+                      &dvalues, &dnulls, &nelems);
+    *idList = calloc(sizeof(int), nelems);
+    *idListCount = 0;
+    for(int i=0; i<nelems; i++) {
+      if (!dnulls[i])
+        *idList[*idListCount++] = DatumGetInt32(dvalues[i]);
+    }
+  }else{
+    *idList = calloc(sizeof(int), 1);
+    *idListCount = 1;
+    // assert type?
+    *idList[0] = DatumGetInt32(newqual->value);
+  }
+}
+
 static void executeQualList(ForeignScanState *scanState)
 {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
@@ -706,34 +760,13 @@ static void executeQualList(ForeignScanState *scanState)
       if (state->idColumnIndex >= 0 &&
           newqual->base.varattno - 1 == state->idColumnIndex) {
         // _id qual
-        state->idListIdx = 0;
-        if(newqual->isnull){
-          state->idList = (void*)1; // non null
-          state->idListCount = 0;
-        }else if(!newqual->isnull && newqual->base.isArray ) {
-          ArrayType* array = DatumGetArrayTypeP(newqual->value);
-          Oid elmtype = ARR_ELEMTYPE(array);
-          Datum *dvalues;
-          bool *dnulls;
-          int nelems;
-          int16 elmlen;
-          bool elmbyval;
-          char elmalign;
-          get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
-          deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign,
-                            &dvalues, &dnulls, &nelems);
-          state->idList = calloc(sizeof(int), nelems);
-          state->idListCount = 0;
-          for(int i=0; i<nelems; i++) {
-            if (!dnulls[i])
-              state->idList[state->idListCount++] = DatumGetInt32(dvalues[i]);
-          }
-        }else{
-          state->idList = calloc(sizeof(int), 1);
-          state->idListCount = 1;
-          // assert type?
-          state->idList[0] = DatumGetInt32(newqual->value);
-        }
+        state->idListIdx = -1;
+        parseQualIntoIdList(&state->idList, &state->idListCount, newqual);
+      }
+      if (state->entityIdColumnIndex >= 0 &&
+          newqual->base.varattno - 1 == state->entityIdColumnIndex) {
+        // _entity_id qual
+        parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, newqual);
       }
     }
   }
@@ -774,8 +807,8 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     int *fields = calloc(sizeof(int), state->columnCount);
     for (int i = 0; i < state->columnCount; i++)
       fields[i] = state->columnMapping[i].tsfIdx;
-    state->iter =
-        tsf_query_table(state->tsf, state->sourceId, state->columnCount, fields, -1, NULL);
+    state->iter = tsf_query_table(state->tsf, state->sourceId, state->columnCount, fields,
+                                  state->entityIdListCount, state->entityIdList);
     free(fields);
     if (!state->iter) {
       ereport(ERROR, (errmsg("Failed to start TSF table query"),
@@ -784,12 +817,21 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
   }
 
   if (state->idList) {
-    for(int i=0; i<state->idListCount; i++)
     // Special iteration if we are doing ID lookups
-    if (state->idListIdx < state->idListCount &&
-        tsf_iter_id(state->iter, state->idList[state->idListIdx++])) {
-      FillTupleSlot(state->iter, state->columnMapping, columnValues, columnNulls, state->idColumnIndex);
-      ExecStoreVirtualTuple(tupleSlot);
+    if (state->iter->cur_entity_idx >= 0 &&
+        state->iter->cur_entity_idx + 1 < state->iter->entity_count) {
+      // If there are more entities to scan for the current ID, use iter_next to scan those
+      if (tsf_iter_next(state->iter)) {
+        FillTupleSlot(state, columnValues, columnNulls);
+        ExecStoreVirtualTuple(tupleSlot);
+      }
+    } else {
+      state->idListIdx++;
+      if (state->idListIdx < state->idListCount &&
+          tsf_iter_id(state->iter, state->idList[state->idListIdx])) {
+        FillTupleSlot(state, columnValues, columnNulls);
+        ExecStoreVirtualTuple(tupleSlot);
+      }
     }
   } else {
     // TODO: Have special iteration mode with quals:
@@ -800,7 +842,7 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     // - still need to learn how OR compound statements work at this level
 
     if (tsf_iter_next(state->iter)) {
-      FillTupleSlot(state->iter, state->columnMapping, columnValues, columnNulls, state->idColumnIndex);
+      FillTupleSlot(state, columnValues, columnNulls);
       ExecStoreVirtualTuple(tupleSlot);
     }
   }
@@ -819,35 +861,32 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   /* if we executed a query, reclaim tsf related resources */
+  elog(INFO, "entering function %s", __func__);
   if (state != NULL) {
     tsf_iter_close(state->iter);
     tsf_close_file(state->tsf);
     free(state->idList);
+    free(state->entityIdList);
   }
 }
 
 /*
- * TsfReScanForeignScan rescans the foreign table. We can re-use some
- * state and open handles.
+ * TsfReScanForeignScan rescans the foreign table.
+ *
+ * Note: from tracing, it looks like TsfBeginForeignScan is always called before this.
  */
 static void TsfReScanForeignScan(ForeignScanState *scanState) {
-  elog(DEBUG1, "entering function %s", __func__);
+  elog(INFO, "entering function %s", __func__);
 
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
-  tsf_iter* iter = state->iter;
-
-  int fieldCount = state->columnCount;
-  int* fields = calloc(sizeof(int), fieldCount);
-  for (int i = 0; i < state->columnCount; i++)
-    fields[i] = state->columnMapping[i].tsfIdx;
-
-  // New iter
-  tsf_iter* new_iter = tsf_query_table(state->tsf, iter->source_id, fieldCount, fields, -1, NULL);
-  free(fields);
-
-  tsf_iter_close(iter);
-
-  state->iter = new_iter;
+  if(state->iter) {
+    // This happens on inner loops, where the conditional values is
+    // re-bound and we clear the iterator here and it gets picked up in
+    // the first ForeignScan with a NULL error.
+    elog(INFO, "ReScan clearing iter state %s", __func__);
+    tsf_iter_close(state->iter);
+    state->iter = NULL;
+  }
 }
 
 /*
@@ -917,6 +956,7 @@ static void BuildColumnMapping(Oid foreignTableId, List *columnList, tsf_source 
   executionState->columnMapping = palloc0(sizeof(ColumnMapping) * length);
   executionState->columnCount = 0;
   executionState->idColumnIndex = -1;
+  executionState->entityIdColumnIndex = -1;
 
   foreach (columnCell, columnList) {
     Var *column = (Var *)lfirst(columnCell);
@@ -926,6 +966,11 @@ static void BuildColumnMapping(Oid foreignTableId, List *columnList, tsf_source 
     // Sentinal fields (not in backend table, provided by iter data)
     if (stricmp(columnName, "_id") == 0) {
       executionState->idColumnIndex = columnId - 1;
+      continue;
+    }
+
+    if (stricmp(columnName, "_entity_id") == 0) {
+      executionState->entityIdColumnIndex = columnId - 1;
       continue;
     }
 
@@ -957,17 +1002,16 @@ static void BuildColumnMapping(Oid foreignTableId, List *columnList, tsf_source 
  * field it converts it to the PostgreSQL Datum type and places it in
  * columnValues at the appropriate index.
  */
-static void FillTupleSlot(tsf_iter *iter, ColumnMapping *columnMappings, Datum *columnValues,
-                          bool *columnNulls, int32 idColumnIndex)
+static void FillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *columnNulls)
 {
-  for (int i = 0; i<iter->field_count; i++)
+  for (int i = 0; i<state->iter->field_count; i++)
   {
-    ColumnMapping *columnMapping = &columnMappings[i];
+    ColumnMapping *columnMapping = &state->columnMapping[i];
     Oid columnTypeId = columnMapping->columnTypeId;
     Oid columnArrayTypeId = columnMapping->columnArrayTypeId;
-    tsf_field* f = iter->fields[i];
-    tsf_v value = iter->cur_values[i];
-    bool is_null  = iter->cur_nulls[i];
+    tsf_field* f = state->iter->fields[i];
+    tsf_v value = state->iter->cur_values[i];
+    bool is_null  = state->iter->cur_nulls[i];
     int32 columnIndex = columnMapping->columnIndex;
 
     /* fill in corresponding column value and null flag */
@@ -980,15 +1024,19 @@ static void FillTupleSlot(tsf_iter *iter, ColumnMapping *columnMappings, Datum *
         columnValues[columnIndex] = ColumnValue(value, f, columnTypeId);
     }
   }
-  if (idColumnIndex >= 0) {
-    columnValues[idColumnIndex] = Int32GetDatum(iter->cur_record_id);
-    columnNulls[idColumnIndex] = false;
+  if (state->idColumnIndex >= 0) {
+    columnValues[state->idColumnIndex] = Int32GetDatum(state->iter->cur_record_id);
+    columnNulls[state->idColumnIndex] = false;
+  }
+  if (state->entityIdColumnIndex >= 0) {
+    columnValues[state->entityIdColumnIndex] = Int32GetDatum(state->iter->entity_ids[state->iter->cur_entity_idx]);
+    columnNulls[state->entityIdColumnIndex] = false;
   }
 }
 
 /*
  * ColumnValueArray uses array element type id to read the current array pointed
- * to by the BSON iterator, and converts each array element (with matching type)
+ * to by the tsf_v value, and converts each array element (with matching type)
  * to the corresponding PostgreSQL datum. Then, the function constructs an array
  * datum from element datums, and returns the array datum.
  */

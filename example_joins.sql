@@ -11,3 +11,12 @@ WHERE l._id = j._id AND r._id = ANY(j.record_mapping_) LIMIT 10;
 SELECT t.*
 FROM refseq_2 t, refseq_3 j
 WHERE j._id = ? AND t._id = ANY(j.record_mapping_);
+
+-- Generates inner queries that utalize the ReScan FDW function
+SELECT caridio_vars_1._id FROM caridio_vars_1
+INNER JOIN caridio_refseq_1 ON (caridio_vars_1._id = caridio_refseq_1._id) 
+WHERE 
+( 
+   caridio_refseq_1.genenames @> ARRAY['APOB']::text[]  AND 
+   caridio_refseq_1.effectcombined IN ('Missense', 'LoF') 
+);

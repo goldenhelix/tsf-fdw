@@ -31,6 +31,7 @@
 
 #include "access/reloptions.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_opfamily.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/vacuum.h"
@@ -383,6 +384,81 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   baserel->rows = outputRowCount;
 }
 
+static PathKey* buildPathKey(Oid relid, Var* var)
+{
+  PathKey *pk = makeNode(PathKey);
+  EquivalenceClass *ec = makeNode(EquivalenceClass);
+  ec->ec_relids = bms_add_member(ec->ec_relids, relid);
+  ec->ec_opfamilies = lappend_oid(ec->ec_opfamilies, INTEGER_BTREE_FAM_OID); //integer_ops
+  ec->ec_collation = 0;
+  ec->ec_members = NIL;
+  ec->ec_sources = NULL;
+  ec->ec_derives = NIL;
+  ec->ec_has_const = false;
+  ec->ec_has_volatile = false;
+  ec->ec_below_outer_join = false;
+  ec->ec_broken = false;
+  ec->ec_sortref = 0;
+  ec->ec_merged = NULL;
+
+  EquivalenceMember *em = makeNode(EquivalenceMember);
+  em->em_expr = copyObject(var);
+  em->em_relids = ec->ec_relids;
+  em->em_nullable_relids = NULL;
+  em->em_is_const = false;
+  em->em_is_child = false;
+  em->em_datatype = var->vartype;
+  ec->ec_members = lappend(ec->ec_members, em);
+
+  pk->pk_eclass = ec;
+  pk->pk_opfamily = INTEGER_BTREE_FAM_OID;
+  pk->pk_strategy = BTLessStrategyNumber;
+  pk->pk_nulls_first = false;
+  return pk;
+}
+
+/**
+ * This doesn't work the way I want.
+ *
+ * EXPLAIN select _id, chr, start, stop, refalt from tn_1 ORDER BY _id LIMIT 10;
+ *
+ *  Still shows a Sort operation around the foreign scan, but it should
+ *  pick up from the PathKeys that the table is sorted by _id.
+ */
+static List* buildPathKeys(PlannerInfo *root, List *columnList)
+{
+  List *pathKeys = NIL;
+  ListCell *columnCell = NULL;
+  PathKey *idKey = NULL;
+  PathKey *entityKey = NULL;
+
+  foreach (columnCell, columnList) {
+    Var *var = (Var *)lfirst(columnCell);
+    RangeTblEntry *rte = rte = planner_rt_fetch(var->varno, root);
+	char	   *attname = get_attname(rte->relid, var->varattno);
+    if(!attname)
+      continue;
+
+    // Sentinal fields (not in backend table, provided by iter data)
+    if (stricmp(attname, "_id") == 0) {
+      idKey = buildPathKey(rte->relid, var);
+      elog(INFO, "build _id path key");
+      continue;
+    }
+
+    if (stricmp(attname, "_entity_id") == 0) {
+      entityKey = buildPathKey(rte->relid, var);
+      elog(INFO, "built _entity_id path key");
+      continue;
+    }
+  }
+  if(idKey)
+    pathKeys = lappend(pathKeys, idKey);
+  if(id && entityKey)
+    pathKeys = lappend(pathKeys, entityKey);
+  return pathKeys;
+}
+
 /*
  * TsfGetForeignPaths creates possible access paths for a scan on the foreign
  * table. We currently have one possible access path. This path filters out row
@@ -406,6 +482,8 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   Cost startupCost = 10;
   Cost totalCost = (baserel->rows * queryColumnCount) + startupCost;
 
+  // We can provide ordering gurantees on _id and _entity_id;
+  List *pathKeys = buildPathKeys(root, queryColumnList);
 
   // TODO: We can gurantee ordering by ID, so should set 'pathkeys'
   // appropriately
@@ -414,7 +492,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   foreignScanPath =
       (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
                                       totalCost,
-                                      NIL, /* no known ordering */
+                                      pathKeys, /* no known ordering */
                                       NULL,           /* not parameterized */
                                       NIL);           /* no fdw_private */
 

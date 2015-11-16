@@ -454,7 +454,7 @@ static List* buildPathKeys(PlannerInfo *root, List *columnList)
   }
   if(idKey)
     pathKeys = lappend(pathKeys, idKey);
-  if(id && entityKey)
+  if(idKey && entityKey)
     pathKeys = lappend(pathKeys, entityKey);
   return pathKeys;
 }

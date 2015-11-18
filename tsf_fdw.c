@@ -131,6 +131,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                                       List *targetList,
                                       List *restrictionClauses);
 static List *ColumnList(RelOptInfo *baserel);
+static int IndexOfFirstBaseRelField(RelOptInfo *baserel, Oid foreignTableId, tsf_source *tsfSource);
 
 static void TsfExplainForeignScan(ForeignScanState *scanState,
                                   ExplainState *explainState);
@@ -356,7 +357,6 @@ static StringInfo OptionNamesString(Oid currentContextId) {
  */
 static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                  Oid foreignTableId) {
-  //elog(INFO, "entering function %s", __func__);
 
   // TODO: use extractRestrictions and id checks to have different estimates
 
@@ -377,10 +377,19 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
              errhint("There are %d sources in the TSF", tsf->source_count)));
   }
   tsf_source *tsfSource = &tsf->sources[tsfFdwOptions->sourceId - 1];
-  int rowCount = tsfSource->fields[0].field_type == FieldEntityAttribute ? tsfSource->entity_count
+  int firstFieldIdx = IndexOfFirstBaseRelField(baserel, foreignTableId, tsfSource);
+  if(firstFieldIdx < 0) {
+    ereport(ERROR,
+            (errmsg("No fields in relation matching source id %s:%d", tsfFdwOptions->filename,
+                    tsfFdwOptions->sourceId),
+             errhint("Scanning the relation did not match any field symbols in the TSF source")));
+  }
+  int rowCount = tsfSource->fields[firstFieldIdx].field_type == FieldEntityAttribute ? tsfSource->entity_count
                                                                         : tsfSource->locus_count;
   tsf_close_file(tsf);
   double outputRowCount = clamp_row_est(rowCount * rowSelectivity);
+ //elog(INFO, "function %s, rowCount %d, rowSelectivity: %f, clamped: %f", __func__, rowCount,
+  //     rowSelectivity, outputRowCount);
   baserel->rows = outputRowCount;
 }
 
@@ -442,13 +451,13 @@ static List* buildPathKeys(PlannerInfo *root, List *columnList)
     // Sentinal fields (not in backend table, provided by iter data)
     if (stricmp(attname, "_id") == 0) {
       idKey = buildPathKey(rte->relid, var);
-      elog(INFO, "build _id path key");
+      //elog(INFO, "build _id path key");
       continue;
     }
 
     if (stricmp(attname, "_entity_id") == 0) {
       entityKey = buildPathKey(rte->relid, var);
-      elog(INFO, "built _entity_id path key");
+      //elog(INFO, "built _entity_id path key");
       continue;
     }
   }
@@ -485,14 +494,11 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   // We can provide ordering gurantees on _id and _entity_id;
   List *pathKeys = buildPathKeys(root, queryColumnList);
 
-  // TODO: We can gurantee ordering by ID, so should set 'pathkeys'
-  // appropriately
-
   /* create a foreign path node and add it as the only possible path */
   foreignScanPath =
       (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
                                       totalCost,
-                                      pathKeys, /* no known ordering */
+                                      pathKeys,
                                       NULL,           /* not parameterized */
                                       NIL);           /* no fdw_private */
 
@@ -666,6 +672,32 @@ static List *ColumnList(RelOptInfo *baserel) {
   }
 
   return columnList;
+}
+
+static int IndexOfFirstBaseRelField(RelOptInfo *baserel, Oid foreignTableId, tsf_source *tsfSource)
+{
+  List *columnList = baserel->reltargetlist;
+  ListCell *columnCell = NULL;
+
+  foreach (columnCell, columnList) {
+    Var *column = (Var *)lfirst(columnCell);
+    AttrNumber columnId = column->varattno;
+    char *columnName = get_attname(foreignTableId, columnId);
+    if(columnName == NULL)
+      continue;
+
+    // Sentinal fields (not in backend table, provided by iter data)
+    if (stricmp(columnName, "_id") == 0 || stricmp(columnName, "_entity_id") == 0) {
+      continue;
+    }
+    // Find this coloumn by its symbol name in the source
+    for (int j = 0; j < tsfSource->field_count; j++) {
+      if (stricmp(tsfSource->fields[j].symbol, columnName) == 0) {
+        return j;
+      }
+    }
+  }
+  return -1;
 }
 
 /*

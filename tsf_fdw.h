@@ -24,6 +24,7 @@
 /* Defines for valid option names */
 #define OPTION_NAME_FILENAME "filename"
 #define OPTION_NAME_SOURCEID "sourceid"
+#define OPTION_NAME_FIELDTYPE "fieldtype"
 
 // TODO: Could add options about how matrix fields are collated
 
@@ -42,11 +43,12 @@ typedef struct TsfValidOption {
 } TsfValidOption;
 
 /* Array of options that are valid for tsf_fdw */
-static const uint32 ValidOptionCount = 2;
+static const uint32 ValidOptionCount = 3;
 static const TsfValidOption ValidOptionArray[] = {
     /* foreign table options */
     {OPTION_NAME_FILENAME, ForeignTableRelationId},
     {OPTION_NAME_SOURCEID, ForeignTableRelationId},
+    {OPTION_NAME_FIELDTYPE, ForeignTableRelationId},
 };
 
 /*
@@ -57,6 +59,7 @@ static const TsfValidOption ValidOptionArray[] = {
 typedef struct TsfFdwOptions {
   char *filename;
   int sourceId; //-1 is auto-detect (first)
+  tsf_field_type fieldType;
 } TsfFdwOptions;
 
 /* Function declarations for foreign data wrapper */

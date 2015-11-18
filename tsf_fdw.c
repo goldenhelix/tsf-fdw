@@ -92,6 +92,8 @@ typedef struct TsfFdwExecState
   struct ColumnMapping *columnMapping;
 
   int sourceId;
+  tsf_field_type fieldType;
+
   tsf_file *tsf;
   tsf_iter* iter;
 
@@ -131,7 +133,6 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                                       List *targetList,
                                       List *restrictionClauses);
 static List *ColumnList(RelOptInfo *baserel);
-static int IndexOfFirstBaseRelField(RelOptInfo *baserel, Oid foreignTableId, tsf_source *tsfSource);
 
 static void TsfExplainForeignScan(ForeignScanState *scanState,
                                   ExplainState *explainState);
@@ -178,6 +179,16 @@ static const char* psql_type(tsf_value_type type)
   }
 }
 
+static const char* FieldTypeLetter(tsf_field_type fieldType)
+{
+  switch(fieldType) {
+    case FieldLocusAttribute: return "l";
+    case FieldEntityAttribute: return "e";
+    case FieldMatrix: return "m";
+    default: return "";
+  }
+}
+
 static void create_table_schema(stringbuilder *str, const char *prefix, const char *fileName,
                                 int sourceId, tsf_source *s, tsf_field_type fieldType,
                                 const char *tableSuffix)
@@ -207,7 +218,8 @@ static void create_table_schema(stringbuilder *str, const char *prefix, const ch
   }
   if (foundOne) {
     sb_append_str(str, "\n       )\n       SERVER tsf_server\n");
-    asprintf(&buf, "       OPTIONS (filename '%s', sourceid '%d');\n", fileName, sourceId);
+    const char* fieldTypeStr = FieldTypeLetter(fieldType);
+    asprintf(&buf, "       OPTIONS (filename '%s', sourceid '%d', fieldtype '%s');\n", fileName, sourceId, fieldTypeStr);
     sb_append_str(str, buf);
     free(buf);
   }
@@ -315,11 +327,22 @@ Datum tsf_fdw_validator(PG_FUNCTION_ARGS) {
                               optionNamesString->data)));
     }
 
-    /* if port option is given, error out if its value isn't an integer */
     if (strncmp(optionName, OPTION_NAME_SOURCEID, NAMEDATALEN) == 0) {
       char *optionValue = defGetString(optionDef);
       sourceId = pg_atoi(optionValue, sizeof(int32), 0);
       (void) sourceId; // remove warning
+    }
+
+    if (strncmp(optionName, OPTION_NAME_FIELDTYPE, NAMEDATALEN) == 0) {
+      char *optionValue = defGetString(optionDef);
+      if ((strncmp(optionValue, "m", NAMEDATALEN) != 0) &&
+          (strncmp(optionValue, "l", NAMEDATALEN) != 0) &&
+          (strncmp(optionValue, "e", NAMEDATALEN) != 0)) {
+        ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                        errmsg("invalid value for \"%s\"", optionName),
+                        errhint("Valid values are 'm' or matrix, 'l' for locus attribute or 'e' "
+                                "for entity attribute.")));
+      }
     }
   }
 
@@ -377,15 +400,26 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
              errhint("There are %d sources in the TSF", tsf->source_count)));
   }
   tsf_source *tsfSource = &tsf->sources[tsfFdwOptions->sourceId - 1];
-  int firstFieldIdx = IndexOfFirstBaseRelField(baserel, foreignTableId, tsfSource);
-  if(firstFieldIdx < 0) {
-    ereport(ERROR,
-            (errmsg("No fields in relation matching source id %s:%d", tsfFdwOptions->filename,
-                    tsfFdwOptions->sourceId),
-             errhint("Scanning the relation did not match any field symbols in the TSF source")));
+
+  int rowCount;
+  // matrix should be entity_count * locus_count
+  switch(tsfFdwOptions->fieldType) {
+    case FieldEntityAttribute:
+      rowCount = tsfSource->entity_count;
+      break;
+    case FieldLocusAttribute:
+      rowCount = tsfSource->locus_count;
+      break;
+    case FieldMatrix:
+      rowCount = tsfSource->locus_count * tsfSource->entity_count;
+      break;
+    default:
+    {
+      ereport(ERROR,
+              (errmsg("Invalid field type specified %s:%d", tsfFdwOptions->filename, tsfFdwOptions->sourceId),
+               errhint("The fieldtype option to the tsf_fdw tables must be set to 'l', 'm', or 'e'")));
+    }
   }
-  int rowCount = tsfSource->fields[firstFieldIdx].field_type == FieldEntityAttribute ? tsfSource->entity_count
-                                                                        : tsfSource->locus_count;
   tsf_close_file(tsf);
   double outputRowCount = clamp_row_est(rowCount * rowSelectivity);
  //elog(INFO, "function %s, rowCount %d, rowSelectivity: %f, clamped: %f", __func__, rowCount,
@@ -434,7 +468,7 @@ static PathKey* buildPathKey(Oid relid, Var* var)
  *  Still shows a Sort operation around the foreign scan, but it should
  *  pick up from the PathKeys that the table is sorted by _id.
  */
-static List* buildPathKeys(PlannerInfo *root, List *columnList)
+static List* buildPathKeys(PlannerInfo *root, List *columnList, Oid foreignTableId)
 {
   List *pathKeys = NIL;
   ListCell *columnCell = NULL;
@@ -444,7 +478,9 @@ static List* buildPathKeys(PlannerInfo *root, List *columnList)
   foreach (columnCell, columnList) {
     Var *var = (Var *)lfirst(columnCell);
     RangeTblEntry *rte = rte = planner_rt_fetch(var->varno, root);
-	char	   *attname = get_attname(rte->relid, var->varattno);
+    if(rte->relid != foreignTableId)
+      continue;
+    char *attname = get_attname(rte->relid, var->varattno);
     if(!attname)
       continue;
 
@@ -492,7 +528,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   Cost totalCost = (baserel->rows * queryColumnCount) + startupCost;
 
   // We can provide ordering gurantees on _id and _entity_id;
-  List *pathKeys = buildPathKeys(root, queryColumnList);
+  List *pathKeys = buildPathKeys(root, queryColumnList, foreignTableId);
 
   /* create a foreign path node and add it as the only possible path */
   foreignScanPath =
@@ -674,32 +710,6 @@ static List *ColumnList(RelOptInfo *baserel) {
   return columnList;
 }
 
-static int IndexOfFirstBaseRelField(RelOptInfo *baserel, Oid foreignTableId, tsf_source *tsfSource)
-{
-  List *columnList = baserel->reltargetlist;
-  ListCell *columnCell = NULL;
-
-  foreach (columnCell, columnList) {
-    Var *column = (Var *)lfirst(columnCell);
-    AttrNumber columnId = column->varattno;
-    char *columnName = get_attname(foreignTableId, columnId);
-    if(columnName == NULL)
-      continue;
-
-    // Sentinal fields (not in backend table, provided by iter data)
-    if (stricmp(columnName, "_id") == 0 || stricmp(columnName, "_entity_id") == 0) {
-      continue;
-    }
-    // Find this coloumn by its symbol name in the source
-    for (int j = 0; j < tsfSource->field_count; j++) {
-      if (stricmp(tsfSource->fields[j].symbol, columnName) == 0) {
-        return j;
-      }
-    }
-  }
-  return -1;
-}
-
 /*
  * TsfExplainForeignScan produces extra output for the Explain command.
  */
@@ -708,8 +718,9 @@ static void TsfExplainForeignScan(ForeignScanState *scanState,
   Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
   TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
 
-  ExplainPropertyText("Tsf File", tsfFdwOptions->filename, explainState);
-  ExplainPropertyLong("Tsf Source ID", tsfFdwOptions->sourceId, explainState);
+  ExplainPropertyText("TSF File", tsfFdwOptions->filename, explainState);
+  ExplainPropertyLong("TSF Source ID", tsfFdwOptions->sourceId, explainState);
+  ExplainPropertyText("TSF Field Type", FieldTypeLetter(tsfFdwOptions->fieldType), explainState);
 
   /* supress file size if we're not showing cost details */
   if (explainState->costs) {
@@ -795,6 +806,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
 
   executionState->tsf = tsf;
   executionState->sourceId = tsfFdwOptions->sourceId;
+  executionState->fieldType = tsfFdwOptions->fieldType;
   executionState->iter = NULL;
 
   scanState->fdw_state = (void *)executionState;
@@ -918,7 +930,7 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     for (int i = 0; i < state->columnCount; i++)
       fields[i] = state->columnMapping[i].tsfIdx;
     state->iter = tsf_query_table(state->tsf, state->sourceId, state->columnCount, fields,
-                                  state->entityIdListCount, state->entityIdList);
+                                  state->entityIdListCount, state->entityIdList, state->fieldType);
     free(fields);
     if (!state->iter) {
       ereport(ERROR, (errmsg("Failed to start TSF table query"),
@@ -1007,16 +1019,27 @@ static void TsfReScanForeignScan(ForeignScanState *scanState) {
 static TsfFdwOptions *TsfGetOptions(Oid foreignTableId) {
   TsfFdwOptions *tsfFdwOptions = NULL;
   char *filename = NULL;
+  char *fieldTypeStr = NULL;
   char *sourceIdName = NULL;
   int32 sourceId = 0;
 
   filename = TsfGetOptionValue(foreignTableId, OPTION_NAME_FILENAME);
   sourceIdName = TsfGetOptionValue(foreignTableId, OPTION_NAME_SOURCEID);
   sourceId = pg_atoi(sourceIdName, sizeof(int32), 1);
+  fieldTypeStr = TsfGetOptionValue(foreignTableId, OPTION_NAME_FIELDTYPE);
 
   tsfFdwOptions = (TsfFdwOptions *)palloc0(sizeof(TsfFdwOptions));
   tsfFdwOptions->filename = filename;
   tsfFdwOptions->sourceId = sourceId;
+  tsfFdwOptions->fieldType = FieldTypeInvalid;
+  if (fieldTypeStr) {
+    if (strncmp(fieldTypeStr, "l", NAMEDATALEN) == 0)
+      tsfFdwOptions->fieldType = FieldLocusAttribute;
+    if (strncmp(fieldTypeStr, "e", NAMEDATALEN) == 0)
+      tsfFdwOptions->fieldType = FieldEntityAttribute;
+    if (strncmp(fieldTypeStr, "m", NAMEDATALEN) == 0)
+      tsfFdwOptions->fieldType = FieldMatrix;
+  }
 
   return tsfFdwOptions;
 }

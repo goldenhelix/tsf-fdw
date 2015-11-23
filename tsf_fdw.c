@@ -211,7 +211,7 @@ static void create_table_schema(stringbuilder *str, const char *prefix, const ch
         if (fieldType == FieldMatrix)
           sb_append_str(str, ",\n       _entity_id integer");
       }
-      asprintf(&buf, ",\n       %s %s", s->fields[i].symbol, psql_type(s->fields[i].value_type));
+      asprintf(&buf, ",\n       \"%s\" %s", s->fields[i].symbol, psql_type(s->fields[i].value_type));
       sb_append_str(str, buf);
       free(buf);
     }

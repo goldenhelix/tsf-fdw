@@ -11,8 +11,12 @@
  * [https://github.com/citusdata/mongo_fdw] as an implementation
  * guide. Thanks to Citus Data for making their FDW open source.
  *
- * Also, the restriction parsing and evaluation is heavily modeled after
- * the Python FDW module Multicorn libary by Kozea
+ * The contrib/postgres_fdw also become vital as a reference for how to
+ * internalize join restrictions and sort orders to provide decent join
+ * performance between TSF foreign tables.
+ *
+ * Finally, the restriction parsing and evaluation is heavily modeled
+ * after the Python FDW module Multicorn libary by Kozea
  * [https://github.com/Kozea/Multicorn/]
  *
  * Copyright (c) 2015 Golden Helix, Inc.
@@ -28,6 +32,7 @@
 #include "tsf.h"
 #include "stringbuilder.h"
 #include "query.h"
+#include "util.h"
 
 #include "access/reloptions.h"
 #include "catalog/pg_type.h"
@@ -39,6 +44,7 @@
 #include "foreign/foreign.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/cost.h"
+#include "optimizer/paths.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
@@ -422,102 +428,42 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   }
   tsf_close_file(tsf);
   double outputRowCount = clamp_row_est(rowCount * rowSelectivity);
- //elog(INFO, "function %s, rowCount %d, rowSelectivity: %f, clamped: %f", __func__, rowCount,
-  //     rowSelectivity, outputRowCount);
+  //elog(INFO, "function %s[%d], rowCount %d, rowSelectivity: %f, clamped: %f", __func__, tsfFdwOptions->sourceId, rowCount, rowSelectivity, outputRowCount);
   baserel->rows = outputRowCount;
 }
 
-static PathKey* buildPathKey(Oid relid, Var* var)
+static bool exprVarNameMatch(Expr* expr, Oid foreignTableId, PlannerInfo *root, const char* name)
 {
-  PathKey *pk = makeNode(PathKey);
-  EquivalenceClass *ec = makeNode(EquivalenceClass);
-  ec->ec_relids = bms_add_member(ec->ec_relids, relid);
-  ec->ec_opfamilies = lappend_oid(ec->ec_opfamilies, INTEGER_BTREE_FAM_OID); //integer_ops
-  ec->ec_collation = 0;
-  ec->ec_members = NIL;
-  ec->ec_sources = NULL;
-  ec->ec_derives = NIL;
-  ec->ec_has_const = false;
-  ec->ec_has_volatile = false;
-  ec->ec_below_outer_join = false;
-  ec->ec_broken = false;
-  ec->ec_sortref = 0;
-  ec->ec_merged = NULL;
-
-  EquivalenceMember *em = makeNode(EquivalenceMember);
-  em->em_expr = copyObject(var);
-  em->em_relids = ec->ec_relids;
-  em->em_nullable_relids = NULL;
-  em->em_is_const = false;
-  em->em_is_child = false;
-  em->em_datatype = var->vartype;
-  ec->ec_members = lappend(ec->ec_members, em);
-
-  pk->pk_eclass = ec;
-  pk->pk_opfamily = INTEGER_BTREE_FAM_OID;
-  pk->pk_strategy = BTLessStrategyNumber;
-  pk->pk_nulls_first = false;
-  return pk;
-}
-
-/**
- * This doesn't work the way I want.
- *
- * EXPLAIN select _id, chr, start, stop, refalt from tn_1 ORDER BY _id LIMIT 10;
- *
- *  Still shows a Sort operation around the foreign scan, but it should
- *  pick up from the PathKeys that the table is sorted by _id.
- */
-static List* buildPathKeys(PlannerInfo *root, List *columnList, Oid foreignTableId)
-{
-  List *pathKeys = NIL;
-  ListCell *columnCell = NULL;
-  PathKey *idKey = NULL;
-  PathKey *entityKey = NULL;
-
-  foreach (columnCell, columnList) {
-    Var *var = (Var *)lfirst(columnCell);
-    RangeTblEntry *rte = rte = planner_rt_fetch(var->varno, root);
-    if(rte->relid != foreignTableId)
-      continue;
-    char *attname = get_attname(rte->relid, var->varattno);
-    if(!attname)
-      continue;
-
-    // Sentinal fields (not in backend table, provided by iter data)
-    if (stricmp(attname, "_id") == 0) {
-      idKey = buildPathKey(rte->relid, var);
-      //elog(INFO, "build _id path key");
-      continue;
-    }
-
-    if (stricmp(attname, "_entity_id") == 0) {
-      entityKey = buildPathKey(rte->relid, var);
-      //elog(INFO, "built _entity_id path key");
-      continue;
+  if (nodeTag(expr) == T_Var) {
+    Var *var = (Var *)expr;
+    if (var->varlevelsup == 0) {
+      RangeTblEntry *rte = planner_rt_fetch(var->varno, root);
+      if (rte->relid == foreignTableId) {
+        char *columnName = get_attname(rte->relid, var->varattno);
+        if (columnName && stricmp(columnName, name) == 0)
+          return true;
+      }
     }
   }
-  if(idKey)
-    pathKeys = lappend(pathKeys, idKey);
-  if(idKey && entityKey)
-    pathKeys = lappend(pathKeys, entityKey);
-  return pathKeys;
+  return false;
 }
 
 /*
  * TsfGetForeignPaths creates possible access paths for a scan on the foreign
- * table. We currently have one possible access path. This path filters out row
- * blocks that are refuted by where clauses, and only returns values for the
- * projected columns.
+ * table.
+ *
+ * There is always a "default" full scan path, but given path_keys (ORDER
+ * BY), filters and joins there may be other paths we can directly
+ * internalize.
  */
 static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
                                Oid foreignTableId) {
   //elog(INFO, "entering function %s", __func__);
-  Path *foreignScanPath = NULL;
+  ForeignPath *path = NULL;
 
-  // TODO: Use the findPaths methdo from multiCorn, adding the tuple
-  // ("_id", 1) and when appropriae ("_enitty_id", _rowCount)
-
+  // TODO: postgres_fdw does a "ColumnList" like extraction in GetRelSize
+  // and stores in baserel->fdw_private the computed rows, startupCost,
+  // totalCost. Probably move to that model.
   /*
    * We skip reading columns that are not in query. Here we assume that all
    * columns in relation have the same width.
@@ -527,18 +473,130 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   Cost startupCost = 10;
   Cost totalCost = (baserel->rows * queryColumnCount) + startupCost;
 
-  // We can provide ordering gurantees on _id and _entity_id;
-  List *pathKeys = buildPathKeys(root, queryColumnList, foreignTableId);
+  /*
+   * Create simplest ForeignScan path node and add it to baserel.  This path
+   * corresponds to SeqScan path of regular tables (though depending on what
+   * baserestrict conditions we were able to send to remote, there might
+   * actually be an indexscan happening there).  We already did all the work
+   * to estimate cost and size of this path.
+   */
+  path = create_foreignscan_path(root, baserel, baserel->rows, startupCost, totalCost,
+                                 NIL,  /* no pathkeys */
+                                 NULL, /* not parameterized */
+                                 NIL); /* no fdw_private */
 
-  /* create a foreign path node and add it as the only possible path */
-  foreignScanPath =
-      (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
-                                      totalCost,
-                                      pathKeys,
-                                      NULL,           /* not parameterized */
-                                      NIL);           /* no fdw_private */
+  add_path(baserel, (Path *)path);
 
-  add_path(baserel, foreignScanPath);
+  /*
+   * Look for pathkeys that match the natural sort order of TSF tables
+   */
+  List *usable_pathkeys = NIL;
+  ListCell *lc;
+  foreach (lc, root->query_pathkeys) {
+    PathKey *pathkey = (PathKey *)lfirst(lc);
+    EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
+    Expr *em_expr;
+    /*
+     * Extract the expression and allow only the following pathkeys
+     *  _id ASC
+     *  (_id ASC, _entity_id ASC)
+     */
+    if (!pathkey_ec->ec_has_volatile && (em_expr = find_em_expr_for_rel(pathkey_ec, baserel)) &&
+        pathkey->pk_strategy == BTLessStrategyNumber &&
+        (exprVarNameMatch(em_expr, foreignTableId, root, "_id") ||
+         (list_length(usable_pathkeys) == 1 &&
+          exprVarNameMatch(em_expr, foreignTableId, root, "_entity_id"))))
+      usable_pathkeys = lappend(usable_pathkeys, pathkey);
+    else {
+      /*
+       * Any other pathkeys are not internalizable, so reset.
+       */
+      list_free(usable_pathkeys);
+      usable_pathkeys = NIL;
+      break;
+    }
+  }
+
+  /* Create a path with useful pathkeys, if we found one. */
+  if (usable_pathkeys != NULL) {
+    // No different cost for including these pathkeys, since we are
+    // inherently sorted by _id, _entity_id
+    add_path(baserel, (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
+                                                      totalCost, usable_pathkeys, NULL, NIL));
+  }
+
+  // TODO: Use the findPaths methdo from multiCorn, adding the tuple
+  // ("_id", 1) and when appropriae ("_enitty_id", _rowCount)
+
+  //elog(INFO, "[%f] paths joininfo: [%d], %s", baserel->rows, list_length(baserel->joininfo), nodeToString(baserel->joininfo));
+  //elog(INFO, "[%f] pathkeys: [%d]%s", baserel->rows, list_length(root->query_pathkeys), nodeToString(root->query_pathkeys));
+
+  /*
+   * The above scan examined only "generic" join clauses, not those that
+   * were absorbed into EquivalenceClauses.  See if we can make anything out
+   * of EquivalenceClauses.
+   */
+  if (baserel->has_eclass_joins) {
+    /*
+     * We repeatedly scan the eclass list looking for column references
+     * (or expressions) belonging to the foreign rel.  Each time we find
+     * one, we generate a list of equivalence joinclauses for it, and then
+     * see if any are safe to send to the remote.  Repeat till there are
+     * no more candidate EC members.
+     */
+    ec_member_foreign_arg arg;
+
+    arg.already_used = NIL;
+    for (;;) {
+      List *clauses;
+
+      /* Make clauses, skipping any that join to lateral_referencers */
+      arg.current = NULL;
+      clauses = generate_implied_equalities_for_column(root, baserel, ec_member_matches_foreign,
+                                                       (void *)&arg, baserel->lateral_referencers);
+
+      /* Done if there are no more expressions in the foreign rel */
+      if (arg.current == NULL) {
+        Assert(clauses == NIL);
+        break;
+      }
+
+      ListCell   *lc;
+
+      /* Scan the extracted join clauses */
+      foreach (lc, clauses) {
+        RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
+        Relids required_outer;
+        ParamPathInfo *param_info;
+
+        //elog(INFO, "[%f] restictinfo: %s", baserel->rows, nodeToString(rinfo));
+
+        /* Check if clause can be moved to this rel */
+        //if (!join_clause_is_movable_to(rinfo, baserel))
+        //continue;
+
+        /* See if it is safe to send to remote */
+        //if (!is_foreign_expr(root, baserel, rinfo->clause))
+        //  continue;
+
+        /* Calculate required outer rels for the resulting path */
+        //required_outer = bms_union(rinfo->clause_relids, baserel->lateral_relids);
+        //required_outer = bms_del_member(required_outer, baserel->relid);
+        //if (bms_is_empty(required_outer))
+        //  continue;
+
+        /* Get the ParamPathInfo */
+        //param_info = get_baserel_parampathinfo(root, baserel, required_outer);
+        //Assert(param_info != NULL);
+
+        /* Add it to list unless we already have it */
+        //ppi_list = list_append_unique_ptr(ppi_list, param_info);
+      }
+
+      /* Try again, now ignoring the expression we found this time */
+      arg.already_used = lappend(arg.already_used, arg.current);
+    }
+  }
 }
 
 static bool isIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
@@ -808,6 +866,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   executionState->sourceId = tsfFdwOptions->sourceId;
   executionState->fieldType = tsfFdwOptions->fieldType;
   executionState->iter = NULL;
+  //elog(INFO, "function %s[%d][%d], cols %d", __func__, executionState->sourceId, tsfFdwOptions->fieldType, list_length(columnList));
 
   scanState->fdw_state = (void *)executionState;
 }
@@ -929,6 +988,7 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     int *fields = calloc(sizeof(int), state->columnCount);
     for (int i = 0; i < state->columnCount; i++)
       fields[i] = state->columnMapping[i].tsfIdx;
+    //elog(INFO, "Starting query[%d][%d] cols %d entities: %d", state->sourceId, state->fieldType, state->columnCount, state->entityIdListCount);
     state->iter = tsf_query_table(state->tsf, state->sourceId, state->columnCount, fields,
                                   state->entityIdListCount, state->entityIdList, state->fieldType);
     free(fields);
@@ -939,6 +999,7 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
   }
 
   if (state->idList) {
+    //elog(INFO, "[%d][%d] id scan: %d", state->sourceId, state->fieldType, state->idListIdx);
     // Special iteration if we are doing ID lookups
     if (state->iter->cur_entity_idx >= 0 &&
         state->iter->cur_entity_idx + 1 < state->iter->entity_count) {
@@ -962,7 +1023,8 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     // - circut if fail. (i.e if first condition does most filtering,
     // - most other filters are not run).
     // - still need to learn how OR compound statements work at this level
-
+    // if(state->iter->cur_record_id < 0 || state->iter->cur_record_id >= state->iter->max_record_id - 1)
+    //  elog(INFO, "[%d][%d] iterscan: %d [%d of %d]", state->sourceId, state->fieldType, state->iter->cur_record_id, state->iter->cur_entity_idx, state->iter->entity_count);
     if (tsf_iter_next(state->iter)) {
       FillTupleSlot(state, columnValues, columnNulls);
       ExecStoreVirtualTuple(tupleSlot);
@@ -983,8 +1045,8 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   /* if we executed a query, reclaim tsf related resources */
-  //elog(INFO, "entering function %s", __func__);
   if (state != NULL) {
+    //elog(INFO, "entering function %s[%d][%d] %p %p", __func__, state->sourceId, state->fieldType, state, state->iter);
     tsf_iter_close(state->iter);
     tsf_close_file(state->tsf);
     free(state->idList);
@@ -998,9 +1060,9 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
  * Note: from tracing, it looks like TsfBeginForeignScan is always called before this.
  */
 static void TsfReScanForeignScan(ForeignScanState *scanState) {
-  //elog(INFO, "entering function %s", __func__);
 
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
+  //elog(INFO, "entering function %s[%d][%d] isChanged: %d, %p %p", __func__, state->sourceId, (bool)scanState->ss.ps.chgParam , state->fieldType, state, state->iter);
   if(state->iter) {
     // This happens on inner loops, where the conditional values is
     // re-bound and we clear the iterator here and it gets picked up in

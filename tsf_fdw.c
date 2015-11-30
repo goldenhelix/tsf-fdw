@@ -86,6 +86,21 @@ typedef struct ColumnMapping
 
 } ColumnMapping;
 
+typedef struct TsfFdwRelationInfo {
+  /* baserestrictinfo columns used */
+  List *columnList;
+
+  /* Estimated size and cost for a scan with baserestrictinfo quals. */
+  int width; /* length of columnList */
+  int row_count;
+  int rows_with_param_id;
+  bool is_matrix_source;
+  int rows_with_param_entity_id;
+  double rows_selected;
+  Cost startup_cost;
+  Cost total_cost;
+} TsfFdwRelationInfo;
+
 /*
  * TsfFdwExecState keeps foreign data wrapper specific execution state that we
  * create and hold onto when executing the query.
@@ -139,6 +154,8 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                                       List *targetList,
                                       List *restrictionClauses);
 static List *ColumnList(RelOptInfo *baserel);
+static bool isParamatizable(Oid foreignTableId, RelOptInfo *baserel, Expr *expr,
+                            bool *outIsEntityIdRestriong);
 
 static void TsfExplainForeignScan(ForeignScanState *scanState,
                                   ExplainState *explainState);
@@ -389,9 +406,6 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
   // TODO: use extractRestrictions and id checks to have different estimates
 
-  List *rowClauseList = baserel->baserestrictinfo;
-  double rowSelectivity = clauselist_selectivity(root, rowClauseList, 0, JOIN_INNER, NULL);
-
   TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
   tsf_file *tsf = tsf_open_file(tsfFdwOptions->filename);
   if (tsf->errmsg != NULL) {
@@ -407,17 +421,30 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   }
   tsf_source *tsfSource = &tsf->sources[tsfFdwOptions->sourceId - 1];
 
-  int rowCount;
+  /*
+   * We use PgFdwRelationInfo to pass various information to subsequent
+   * functions.
+   */
+  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *) palloc0(sizeof(TsfFdwRelationInfo));
+  baserel->fdw_private = (void *) fpinfo;
+  fpinfo->columnList = ColumnList(baserel);
+  fpinfo->width = list_length(fpinfo->columnList);
+
   // matrix should be entity_count * locus_count
   switch(tsfFdwOptions->fieldType) {
     case FieldEntityAttribute:
-      rowCount = tsfSource->entity_count;
+      fpinfo->row_count = tsfSource->entity_count;
+      fpinfo->rows_with_param_id = fpinfo->row_count;
       break;
     case FieldLocusAttribute:
-      rowCount = tsfSource->locus_count;
+      fpinfo->row_count = tsfSource->locus_count;
+      fpinfo->rows_with_param_id = fpinfo->row_count;
       break;
     case FieldMatrix:
-      rowCount = tsfSource->locus_count * tsfSource->entity_count;
+      fpinfo->row_count = tsfSource->locus_count * tsfSource->entity_count;
+      fpinfo->rows_with_param_id = tsfSource->entity_count;
+      fpinfo->is_matrix_source = true;
+      fpinfo->rows_with_param_entity_id = tsfSource->locus_count;
       break;
     default:
     {
@@ -427,9 +454,13 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
     }
   }
   tsf_close_file(tsf);
-  double outputRowCount = clamp_row_est(rowCount * rowSelectivity);
-  //elog(INFO, "function %s[%d], rowCount %d, rowSelectivity: %f, clamped: %f", __func__, tsfFdwOptions->sourceId, rowCount, rowSelectivity, outputRowCount);
-  baserel->rows = outputRowCount;
+
+  List *rowClauseList = baserel->baserestrictinfo;
+  double rowSelectivity = clauselist_selectivity(root, rowClauseList, 0, JOIN_INNER, NULL);
+  fpinfo->rows_selected = clamp_row_est(fpinfo->row_count * rowSelectivity);
+  baserel->rows = fpinfo->rows_selected;
+
+  //elog(INFO, "%s[%d][%d], rowCount %d, rowSelectivity: %f, clamped: %f", __func__, tsfFdwOptions->sourceId, tsfFdwOptions->fieldType, fpinfo->row_count, rowSelectivity, fpinfo->rows_selected);
 }
 
 static bool exprVarNameMatch(Expr* expr, Oid foreignTableId, PlannerInfo *root, const char* name)
@@ -458,28 +489,22 @@ static bool exprVarNameMatch(Expr* expr, Oid foreignTableId, PlannerInfo *root, 
  */
 static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
                                Oid foreignTableId) {
-  //elog(INFO, "entering function %s", __func__);
-  ForeignPath *path = NULL;
+  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *) baserel->fdw_private;
 
-  // TODO: postgres_fdw does a "ColumnList" like extraction in GetRelSize
-  // and stores in baserel->fdw_private the computed rows, startupCost,
-  // totalCost. Probably move to that model.
   /*
    * We skip reading columns that are not in query. Here we assume that all
    * columns in relation have the same width.
    */
-  List *queryColumnList = ColumnList(baserel);
-  uint32 queryColumnCount = list_length(queryColumnList);
   Cost startupCost = 10;
-  Cost totalCost = (baserel->rows * queryColumnCount) + startupCost;
+  Cost totalCost = (fpinfo->rows_selected * fpinfo->width) + startupCost;
 
   /*
-   * Create simplest ForeignScan path node and add it to baserel.  This path
-   * corresponds to SeqScan path of regular tables (though depending on what
-   * baserestrict conditions we were able to send to remote, there might
-   * actually be an indexscan happening there).  We already did all the work
-   * to estimate cost and size of this path.
+   * Create simplest ForeignScan path node and add it to baserel.  This
+   * path corresponds to SeqScan path of the table.  We already did all
+   * the work to estimate cost and size of this path in
+   * TsfGetForeignRelSize.
    */
+  ForeignPath *path;
   path = create_foreignscan_path(root, baserel, baserel->rows, startupCost, totalCost,
                                  NIL,  /* no pathkeys */
                                  NULL, /* not parameterized */
@@ -511,6 +536,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
       /*
        * Any other pathkeys are not internalizable, so reset.
        */
+      //elog(INFO, "[%f] Found NON usable pathkeys %s [%s]", baserel->rows, nodeToString(pathkey_ec), nodeToString(usable_pathkeys));
       list_free(usable_pathkeys);
       usable_pathkeys = NIL;
       break;
@@ -521,15 +547,86 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   if (usable_pathkeys != NULL) {
     // No different cost for including these pathkeys, since we are
     // inherently sorted by _id, _entity_id
+    //elog(INFO, "[%f] Found %d usable pathkeys", baserel->rows, list_length(usable_pathkeys));
     add_path(baserel, (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
                                                       totalCost, usable_pathkeys, NULL, NIL));
   }
 
-  // TODO: Use the findPaths methdo from multiCorn, adding the tuple
-  // ("_id", 1) and when appropriae ("_enitty_id", _rowCount)
+  /*
+   * Thumb through all join clauses for the rel to identify which outer
+   * relations could supply one or more safe-to-handle join clauses.
+   * We'll build a parameterized path for each such outer relation.
+   *
+   * It's convenient to manage this by representing each candidate outer
+   * relation by the ParamPathInfo node for it.  We can then use the
+   * ppi_clauses list in the ParamPathInfo node directly as a list of the
+   * interesting join clauses for that rel.  This takes care of the
+   * possibility that there are multiple safe join clauses for such a rel,
+   * and also ensures that we account for unsafe join clauses that we'll
+   * still have to enforce locally (since the parameterized-path machinery
+   * insists that we handle all movable clauses).
+   */
+  List *ppi_list = NIL;
+  foreach(lc, baserel->joininfo)
+  {
+    RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+    Relids		required_outer;
+    ParamPathInfo *param_info;
 
-  //elog(INFO, "[%f] paths joininfo: [%d], %s", baserel->rows, list_length(baserel->joininfo), nodeToString(baserel->joininfo));
-  //elog(INFO, "[%f] pathkeys: [%d]%s", baserel->rows, list_length(root->query_pathkeys), nodeToString(root->query_pathkeys));
+    /* Check if clause can be moved to this rel */
+    if (!join_clause_is_movable_to(rinfo, baserel))
+      continue;
+
+    /* The only paramaterizable expressions are:
+     * _id = $
+     * _entity_id = $
+     */
+    bool isEntityIdRestriction = false;
+    if(!isParamatizable(foreignTableId, baserel, rinfo->clause, &isEntityIdRestriction))
+      continue;
+
+    /* Calculate required outer rels for the resulting path */
+    required_outer = bms_union(rinfo->clause_relids,
+                               baserel->lateral_relids);
+    /* We do not want the foreign rel itself listed in required_outer */
+    required_outer = bms_del_member(required_outer, baserel->relid);
+
+    /*
+     * required_outer probably can't be empty here, but if it were, we
+     * couldn't make a parameterized path.
+     */
+    if (bms_is_empty(required_outer))
+      continue;
+
+    /* Get the ParamPathInfo */
+    param_info = get_baserel_parampathinfo(root, baserel,
+                                           required_outer);
+    Assert(param_info != NULL);
+
+    /*
+     * Add it to list unless we already have it.  Testing pointer equality
+     * is OK since get_baserel_parampathinfo won't make duplicates.
+     */
+    int prev_length = list_length(ppi_list);
+    ppi_list = list_append_unique_ptr(ppi_list, param_info);
+    if(list_length(ppi_list) > prev_length) {
+      double rows_selected = 1; //for _id on non-matrix
+      if(fpinfo->is_matrix_source) {
+        if(isEntityIdRestriction)
+          rows_selected = fpinfo->rows_with_param_entity_id;
+        else
+          rows_selected = fpinfo->rows_with_param_id;
+      }
+
+      totalCost = (rows_selected * fpinfo->width) + startupCost;
+      add_path(baserel, (Path *)create_foreignscan_path(
+                 root, baserel, rows_selected, startupCost, totalCost,
+                 NIL,                       /* no pathkeys */
+                 param_info->ppi_req_outer, /* paramaterized path */
+                 NIL)                       /* no fdw_private list */
+               );
+    }
+  }
 
   /*
    * The above scan examined only "generic" join clauses, not those that
@@ -569,28 +666,50 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
         Relids required_outer;
         ParamPathInfo *param_info;
 
-        //elog(INFO, "[%f] restictinfo: %s", baserel->rows, nodeToString(rinfo));
-
         /* Check if clause can be moved to this rel */
-        //if (!join_clause_is_movable_to(rinfo, baserel))
-        //continue;
+        if (!join_clause_is_movable_to(rinfo, baserel))
+          continue;
 
-        /* See if it is safe to send to remote */
-        //if (!is_foreign_expr(root, baserel, rinfo->clause))
-        //  continue;
+        /* The only paramaterizable expressions are:
+         * _id = $
+         * _entity_id = $
+         */
+        //elog(INFO, "join clause: %s", nodeToString(rinfo->clause));
+        bool isEntityIdRestriction = false;
+        if(!isParamatizable(foreignTableId, baserel, rinfo->clause, &isEntityIdRestriction))
+          continue;
 
         /* Calculate required outer rels for the resulting path */
-        //required_outer = bms_union(rinfo->clause_relids, baserel->lateral_relids);
-        //required_outer = bms_del_member(required_outer, baserel->relid);
-        //if (bms_is_empty(required_outer))
-        //  continue;
+        required_outer = bms_union(rinfo->clause_relids, baserel->lateral_relids);
+        required_outer = bms_del_member(required_outer, baserel->relid);
+        if (bms_is_empty(required_outer))
+          continue;
 
         /* Get the ParamPathInfo */
-        //param_info = get_baserel_parampathinfo(root, baserel, required_outer);
-        //Assert(param_info != NULL);
+        param_info = get_baserel_parampathinfo(root, baserel, required_outer);
+        Assert(param_info != NULL);
 
         /* Add it to list unless we already have it */
-        //ppi_list = list_append_unique_ptr(ppi_list, param_info);
+        int prev_length = list_length(ppi_list);
+        ppi_list = list_append_unique_ptr(ppi_list, param_info);
+        if(list_length(ppi_list) > prev_length) {
+          double rows_selected = 1; //for _id on non-matrix
+          if(fpinfo->is_matrix_source) {
+            if(isEntityIdRestriction)
+              rows_selected = fpinfo->rows_with_param_entity_id;
+            else
+              rows_selected = fpinfo->rows_with_param_id;
+          }
+
+          totalCost = (rows_selected * fpinfo->width) + startupCost;
+          add_path(baserel, (Path *)create_foreignscan_path(
+                     root, baserel, rows_selected, startupCost, totalCost,
+                     NIL,                       /* no pathkeys */
+                     param_info->ppi_req_outer, /* paramaterized path */
+                     NIL)                       /* no fdw_private list */
+                   );
+        }
+
       }
 
       /* Try again, now ignoring the expression we found this time */
@@ -635,6 +754,29 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 }
 
 /*
+ * Returns true if given expr can be cheaply paramaterized (i.e. is _id = $ or _entity_id = $)
+ */
+static bool isParamatizable(Oid foreignTableId, RelOptInfo * baserel, Expr * expr,
+                            bool *outIsEntityIdRestriction)
+{
+  List *quals = NIL;
+  extractRestrictions(baserel->relids, expr, &quals);
+
+  if (list_length(quals) == 1) {
+    MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
+    // Only pamaterizing ID restrictions
+    if (isIdRestriction(foreignTableId, qual))
+      return true;
+    if (isEntityIdRestriction(foreignTableId, qual)) {
+      *outIsEntityIdRestriction = true;
+      return true;
+    }
+    
+  }
+  return false;
+}
+
+/*
  * TsfGetForeignPlan creates a foreign scan plan node for scanning the
  * TSF table. We also add the query column list to scan nodes private
  * list, because we need it later for skipping over unused columns in the
@@ -643,20 +785,17 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreignTableId, ForeignPath *bestPath,
                                       List *targetList, List *scanClauses) {
+  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *) baserel->fdw_private;
   Index scanRangeTableIndex = baserel->relid;
-  ForeignScan *foreignScan = NULL;
-  ListCell *lc = NULL;
-  List *columnList = NIL;
-  List *foreignPrivateList = NIL;
   List *localExprs = NIL;
   List *tsfExprs = NIL;
   Expr *entityIdClause = NULL;
 
-  //elog(INFO, "entering function %s", __func__);
   /*
    * Separate the scan_clauses into those that can be executed
    * internally and those that can't.
    */
+  ListCell *lc = NULL;
   bool foundIdRestriction = false;
   foreach (lc, scanClauses) {
     RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
@@ -689,24 +828,27 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
       }
     } else {
       // Wasn't able to extract these restrictions...
-      //elog(INFO, "Exracted %d quals", list_length(quals));
       localExprs = lappend(localExprs, rinfo->clause);
     }
   }
   if(entityIdClause)
     tsfExprs = lappend(tsfExprs, entityIdClause);
 
+  //elog(INFO, "[%f] extracted %d TSF, %d local quals", baserel->rows, list_length(tsfExprs), list_length(localExprs));
   /*
-   * As an optimization, we only read columns that are present in the query.
-   * To find these columns, we need baserel. We don't have access to baserel
-   * in executor's callback functions, so we get the column list here and put
-   * it into foreign scan node's private list.
+   * As an optimization, we only read columns that are present in the
+   * query.  We already extracted those columns and placed them in
+   * fpinfo. We don't have access to baserel in executor's callback
+   * functions, so we get the column list here and put it into foreign
+   * scan node's private list, which gets copied over to the executor's
+   * memory context.
    */
-  columnList = ColumnList(baserel);
-  foreignPrivateList = list_make1(columnList);
+  List *foreignPrivateList = NIL;
+  foreignPrivateList = list_make1(fpinfo->columnList);
 
 
   /* create the foreign scan node */
+  ForeignScan *foreignScan = NULL;
   foreignScan = make_foreignscan(targetList,
                                  localExprs, /* postgres will run these restrictions on results */
                                  scanRangeTableIndex,
@@ -822,7 +964,6 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY) {
     return;
   }
-  //elog(INFO, "entering function %s", __func__);
 
   Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
   TsfFdwOptions *tsfFdwOptions = TsfGetOptions(foreignTableId);
@@ -866,18 +1007,20 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   executionState->sourceId = tsfFdwOptions->sourceId;
   executionState->fieldType = tsfFdwOptions->fieldType;
   executionState->iter = NULL;
-  //elog(INFO, "function %s[%d][%d], cols %d", __func__, executionState->sourceId, tsfFdwOptions->fieldType, list_length(columnList));
+  //elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId, tsfFdwOptions->fieldType, list_length(columnList), list_length(foreignExprs));
 
   scanState->fdw_state = (void *)executionState;
 }
 
-static void parseQualIntoIdList(int** idList, int* idListCount, MulticornConstQual* newqual)
+static void parseQualIntoIdList(int** idList, int* idListCount, bool isNull,
+                                bool isArray, Datum value)
 {
-  if(newqual->isnull){
-    *idList = (void*)1; // non null
+  if(isNull){
+    free(*idList);
+    *idList = calloc(sizeof(int), 1); // non used, but must be not-null
     *idListCount = 0;
-  }else if(!newqual->isnull && newqual->base.isArray ) {
-    ArrayType* array = DatumGetArrayTypeP(newqual->value);
+  }else if(!isNull && isArray ) {
+    ArrayType* array = DatumGetArrayTypeP(value);
     Oid elmtype = ARR_ELEMTYPE(array);
     Datum *dvalues;
     bool *dnulls;
@@ -888,66 +1031,68 @@ static void parseQualIntoIdList(int** idList, int* idListCount, MulticornConstQu
     get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
     deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign,
                       &dvalues, &dnulls, &nelems);
-    *idList = calloc(sizeof(int), nelems);
+    if(*idListCount != nelems) {
+      free(*idList);
+      *idList = calloc(sizeof(int), nelems);
+    }
     *idListCount = 0;
     for(int i=0; i<nelems; i++) {
       if (!dnulls[i])
         *idList[*idListCount++] = DatumGetInt32(dvalues[i]);
     }
   }else{
-    *idList = calloc(sizeof(int), 1);
-    *idListCount = 1;
+    if(*idListCount != 1) {
+      free(*idList);
+      *idList = calloc(sizeof(int), 1);
+      *idListCount = 1;
+    }
     // assert type?
-    *idList[0] = DatumGetInt32(newqual->value);
+    *idList[0] = DatumGetInt32(value);
   }
 }
 
-static void executeQualList(ForeignScanState *scanState)
+static void executeQualList(ForeignScanState *scanState, bool* updatedEntityIds)
 {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
   ListCell   *lc;
 
   ExprContext *econtext = scanState->ss.ps.ps_ExprContext;
 
-  foreach(lc, state->qualList)
-  {
+  foreach (lc, state->qualList) {
     MulticornBaseQual *qual = lfirst(lc);
-    MulticornConstQual *newqual = NULL;
-    bool		isNull;
-    ExprState  *expr_state = NULL;
+    bool isNull;
+    Datum value;
+    ExprState *expr_state = NULL;
+    bool usable = false;
 
     switch (qual->right_type) {
       case T_Param:
+        usable = true;
         expr_state = ExecInitExpr(((MulticornParamQual *)qual)->expr, (PlanState *)scanState);
-        newqual = palloc0(sizeof(MulticornConstQual));
-        newqual->base.right_type = T_Const;
-        newqual->base.varattno = qual->varattno;
-        newqual->base.opname = qual->opname;
-        newqual->base.isArray = qual->isArray;
-        newqual->base.useOr = qual->useOr;
-        newqual->value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
-        newqual->base.typeoid = qual->typeoid;
-        newqual->isnull = isNull;
+        value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
         break;
       case T_Const:
-        newqual = (MulticornConstQual *)qual;
+        usable = true;
+        value = ((MulticornConstQual *)qual)->value;
+        isNull = ((MulticornConstQual *)qual)->isnull;
         break;
       default:
         break;
     }
-    if (newqual != NULL) {
+    if (usable) {
       // Process const qual into TSF based query state manager.
       // Special case for _id and _entity_id
-      if (state->idColumnIndex >= 0 &&
-          newqual->base.varattno - 1 == state->idColumnIndex) {
+      if (state->idColumnIndex >= 0 && qual->varattno - 1 == state->idColumnIndex) {
         // _id qual
         state->idListIdx = -1;
-        parseQualIntoIdList(&state->idList, &state->idListCount, newqual);
+        parseQualIntoIdList(&state->idList, &state->idListCount, isNull, qual->isArray, value);
       }
       if (state->entityIdColumnIndex >= 0 &&
-          newqual->base.varattno - 1 == state->entityIdColumnIndex) {
+          qual->varattno - 1 == state->entityIdColumnIndex) {
         // _entity_id qual
-        parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, newqual);
+        parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, isNull, qual->isArray, value);
+        if(updatedEntityIds)
+          *updatedEntityIds = true;
       }
     }
   }
@@ -980,11 +1125,10 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
   if (!state->iter) {
     /* initialize all values for this row to null */
 
-    // Evalue expressions we extracted in qualList
-    executeQualList(scanState);
+    // Evalue expressions we extracted in qualList. This updates
+    // state->entityIdList and state->idList.
+    executeQualList(scanState, 0);
 
-    // TODO: executeQualList will set state->entityIdxList,
-    // state->entityIdxCount;
     int *fields = calloc(sizeof(int), state->columnCount);
     for (int i = 0; i < state->columnCount; i++)
       fields[i] = state->columnMapping[i].tsfIdx;
@@ -999,7 +1143,7 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
   }
 
   if (state->idList) {
-    //elog(INFO, "[%d][%d] id scan: %d", state->sourceId, state->fieldType, state->idListIdx);
+    // elog(INFO, "[%d][%d] id scan: %d", state->sourceId, state->fieldType, state->idListIdx);
     // Special iteration if we are doing ID lookups
     if (state->iter->cur_entity_idx >= 0 &&
         state->iter->cur_entity_idx + 1 < state->iter->entity_count) {
@@ -1023,8 +1167,10 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     // - circut if fail. (i.e if first condition does most filtering,
     // - most other filters are not run).
     // - still need to learn how OR compound statements work at this level
-    // if(state->iter->cur_record_id < 0 || state->iter->cur_record_id >= state->iter->max_record_id - 1)
-    //  elog(INFO, "[%d][%d] iterscan: %d [%d of %d]", state->sourceId, state->fieldType, state->iter->cur_record_id, state->iter->cur_entity_idx, state->iter->entity_count);
+
+    // Debug output first and last iteration to see if tables are doing full table scans
+    //if(state->iter->cur_record_id < 0 || state->iter->cur_record_id >= state->iter->max_record_id - 1) elog(INFO, "[%d][%d] iterscan: %d [%d of %d]", state->sourceId, state->fieldType, state->iter->cur_record_id, state->iter->cur_entity_idx, state->iter->entity_count);
+
     if (tsf_iter_next(state->iter)) {
       FillTupleSlot(state, columnValues, columnNulls);
       ExecStoreVirtualTuple(tupleSlot);
@@ -1059,17 +1205,32 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
  *
  * Note: from tracing, it looks like TsfBeginForeignScan is always called before this.
  */
-static void TsfReScanForeignScan(ForeignScanState *scanState) {
-
+static void TsfReScanForeignScan(ForeignScanState *scanState)
+{
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
-  //elog(INFO, "entering function %s[%d][%d] isChanged: %d, %p %p", __func__, state->sourceId, (bool)scanState->ss.ps.chgParam , state->fieldType, state, state->iter);
-  if(state->iter) {
-    // This happens on inner loops, where the conditional values is
-    // re-bound and we clear the iterator here and it gets picked up in
-    // the first ForeignScan with a NULL error.
-    //elog(INFO, "ReScan clearing iter state %s", __func__);
-    tsf_iter_close(state->iter);
-    state->iter = NULL;
+  // elog(INFO, "entering function %s[%d][%d] isChanged: %d, %p %p", __func__, state->sourceId,
+  // (bool)scanState->ss.ps.chgParam , state->fieldType, state, state->iter);
+  if (state->iter) {
+    /*
+     * If any internal parameters affecting this node have changed, we
+     * just re-evalue and update iterator instead of destorying it.
+     */
+    if (scanState->ss.ps.chgParam != NULL) {
+      bool updatedEntityIds = false;
+      executeQualList(scanState, &updatedEntityIds);
+      state->iter->cur_entity_idx = -1; //Reset inner entity counter
+      if(updatedEntityIds) {
+        // Reset iter and let it re-open with tsf_query_table as that
+        // takes the entityIds as a param.
+        //elog(INFO, "reset entity id list");
+        tsf_iter_close(state->iter);
+        state->iter = NULL;
+      }
+    } else {
+      // Close and clear iterator, TsfIterateForeignScan will rebuild
+      tsf_iter_close(state->iter);
+      state->iter = NULL;
+    }
   }
 }
 

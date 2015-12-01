@@ -1037,8 +1037,10 @@ static void parseQualIntoIdList(int** idList, int* idListCount, bool isNull,
     }
     *idListCount = 0;
     for(int i=0; i<nelems; i++) {
-      if (!dnulls[i])
-        *idList[*idListCount++] = DatumGetInt32(dvalues[i]);
+      if (!dnulls[i]) {
+        (*idList)[*idListCount] = DatumGetInt32(dvalues[i]);
+        (*idListCount) += 1;
+      }
     }
   }else{
     if(*idListCount != 1) {

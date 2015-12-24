@@ -119,7 +119,7 @@ typedef struct ColumnMapping
   // mappingFieldIdx is always 0
 
   tsf_iter* iter;
-  tsf_iter* mappingIter;
+  tsf_iter* mappingIter; // Not owned, borrowed from TsfSourceState
 
 } ColumnMapping;
 
@@ -180,7 +180,8 @@ typedef struct TsfSourceState
 {
   int sourceId;
   const char* fileName;
-  tsf_file *tsf; // These are cached somewhere...
+  tsf_file *tsf; // Not owned, borrowed pointer from tsfHandleCache;
+  tsf_iter *mappingIter;  // Owned, used if this is a mapping source
 } TsfSourceState;
 
 /*
@@ -1174,7 +1175,9 @@ static void TsfEndForeignScan(ForeignScanState *scanState) {
     for (int i = 0; i < state->columnCount; i++) {
       ColumnMapping *col = &state->columnMapping[i];
       tsf_iter_close(col->iter);
-      tsf_iter_close(col->mappingIter);
+    }
+    for (int i = 0; i < state->sourceCount; i++) {
+      tsf_iter_close(state->sources[i].mappingIter);
     }
     free(state->idList);
     free(state->entityIdList);
@@ -1617,18 +1620,25 @@ static void initQuery(TsfFdwExecState *state)
     }
     if (col->mappingSourceIdx >= 0) {
       TsfSourceState *mapping = &state->sources[col->mappingSourceIdx];
-      int fields[1];
-      fields[0] = 0;  // mapping field is always 0 in mapping source
-      tsf_field_type mappingFieldType =
+      if(!mapping->mappingIter){
+        // Because a mapping source will be used by every field of the
+        // source it is mapping to the primary table, and it only has a
+        // single mapping field, we have the source own the mappingIter
+        // and use it for all fields using mappingSourceIdx.
+        int fields[1];
+        fields[0] = 0;  // mapping field is always 0 in mapping source
+        tsf_field_type mappingFieldType =
           state->fieldType == FieldEntityAttribute ? FieldEntityAttribute : FieldLocusAttribute;
 
-      col->mappingIter = tsf_query_table(mapping->tsf, mapping->sourceId, 1, fields, -1, NULL,
-                                         mappingFieldType);
-      if (!col->mappingIter) {
-        ereport(ERROR, (errmsg("Failed to start TSF mapping field table query"),
-                        errhint("Query failed on mapping of field %d with source %s:%d",
-                                col->columnIndex, mapping->fileName, mapping->sourceId)));
+        mapping->mappingIter = tsf_query_table(mapping->tsf, mapping->sourceId, 1, fields, -1, NULL,
+                                               mappingFieldType);
+        if (!mapping->mappingIter) {
+          ereport(ERROR, (errmsg("Failed to start TSF mapping field table query"),
+                          errhint("Query failed on mapping of field %d with source %s:%d",
+                                  col->columnIndex, mapping->fileName, mapping->sourceId)));
+        }
       }
+      col->mappingIter = mapping->mappingIter;
     }
   }
 

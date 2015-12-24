@@ -73,7 +73,6 @@
 #error "Only 64-bit machines supported. USE_FLOAT8_BYVAL must be set"
 #endif
 
-
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
 
@@ -85,7 +84,7 @@ PG_FUNCTION_INFO_V1(tsf_fdw_handler);
 PG_FUNCTION_INFO_V1(tsf_fdw_validator);
 
 /* Module load init */
-void		_PG_init(void);
+void _PG_init(void);
 
 typedef struct TsfFdwRelationInfo {
   /* baserestrictinfo columns used */
@@ -106,8 +105,7 @@ typedef struct TsfFdwRelationInfo {
  * For each requested field, we have mapping to TSF source, field,
  * mapping, iterator and Posgres type information.
  */
-typedef struct ColumnMapping
-{
+typedef struct ColumnMapping {
   uint32 columnIndex;
   Oid columnTypeId;
   Oid columnArrayTypeId;
@@ -118,8 +116,8 @@ typedef struct ColumnMapping
   int mappingSourceIdx;
   // mappingFieldIdx is always 0
 
-  tsf_iter* iter;
-  tsf_iter* mappingIter; // Not owned, borrowed from TsfSourceState
+  tsf_iter *iter;
+  tsf_iter *mappingIter;  // Not owned, borrowed from TsfSourceState
 
 } ColumnMapping;
 
@@ -132,55 +130,48 @@ typedef enum {
   RestrictSring
 } RestrictionType;
 
-typedef struct RestrictionBase
-{
-  ColumnMapping* col;
+typedef struct RestrictionBase {
+  ColumnMapping *col;
   RestrictionType type;
-  bool includeMissing; // Include missing values
+  bool includeMissing;  // Include missing values
 } RestrictionBase;
 
-typedef struct IntRestriction
-{
+typedef struct IntRestriction {
   RestrictionBase base;
   int lowerBound;
   int upperBound;
   bool includeBounds;  // Operation is >= and <=, not > and <
 } IntRestriction;
 
-typedef struct DoubleRestriction
-{
+typedef struct DoubleRestriction {
   RestrictionBase base;
   double lowerBound;
   double upperBound;
   bool includeBounds;  // Operation is >= and <=, not > and <
 } DoubleRestriction;
 
-typedef struct EnumRestriction
-{
+typedef struct EnumRestriction {
   RestrictionBase base;
   int includeCount;
-  int* include; // Enum indexes to include
+  int *include;  // Enum indexes to include
 } EnumRestriction;
 
-typedef struct BoolRestriction
-{
+typedef struct BoolRestriction {
   RestrictionBase base;
   bool includeTrue;
   bool includeFalse;
 } BoolRestriction;
 
-typedef struct StringRestriction
-{
+typedef struct StringRestriction {
   RestrictionBase base;
-  const char* match; //Exact match
+  const char *match;  // Exact match
   bool doesNotMatch;
 } StringRestriction;
 
-typedef struct TsfSourceState
-{
+typedef struct TsfSourceState {
   int sourceId;
-  const char* fileName;
-  tsf_file *tsf; // Not owned, borrowed pointer from tsfHandleCache;
+  const char *fileName;
+  tsf_file *tsf;          // Not owned, borrowed pointer from tsfHandleCache;
   tsf_iter *mappingIter;  // Owned, used if this is a mapping source
 } TsfSourceState;
 
@@ -188,8 +179,7 @@ typedef struct TsfSourceState
  * TsfFdwExecState keeps foreign data wrapper specific execution state
  * that we create and hold onto when executing the query.
  */
-typedef struct TsfFdwExecState
-{
+typedef struct TsfFdwExecState {
   // column index here and in columnmapping means index into the tuple
   // representing full width of the FDW table. By convention _id is 0,
   // _entity_id is 1, but technically you can define a FDW table with
@@ -204,13 +194,13 @@ typedef struct TsfFdwExecState
 
   tsf_field_type fieldType;
 
-  TsfSourceState* sources;
+  TsfSourceState *sources;
   int sourceCount;
 
-  tsf_iter *iter;   // Primary iterator (no fields)
+  tsf_iter *iter;  // Primary iterator (no fields)
 
   // Parsed out of qualList is restriciton info
-  List	   *qualList;
+  List *qualList;
 
   // iter to be driven by a specific set of IDs
   int idListIdx;
@@ -224,17 +214,13 @@ typedef struct TsfFdwExecState
 } TsfFdwExecState;
 
 /* FDW Handler Functions */
-static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
-                                 Oid foreignTableId);
-static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
-                               Oid foreignTableId);
-static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
-                                      Oid foreignTableId, ForeignPath *bestPath,
-                                      List *targetList,
+static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId);
+static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId);
+static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
+                                      ForeignPath *bestPath, List *targetList,
                                       List *restrictionClauses);
 
-static void TsfExplainForeignScan(ForeignScanState *scanState,
-                                  ExplainState *explainState);
+static void TsfExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState);
 static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags);
 static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState);
 static void TsfEndForeignScan(ForeignScanState *scanState);
@@ -244,7 +230,7 @@ static void TsfReScanForeignScan(ForeignScanState *scanState);
 /* Table introspection helpders  */
 static TsfFdwOptions *getTsfFdwOptions(Oid foreignTableId);
 static List *columnList(RelOptInfo *baserel);
-static char* strJoin(const char* left, const char* right, char joiner);
+static char *strJoin(const char *left, const char *right, char joiner);
 static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptions *tsfFdwOptions,
                                TsfFdwExecState *executionState);
 
@@ -256,12 +242,11 @@ static bool isParamatizable(Oid foreignTableId, RelOptInfo *baserel, Expr *expr,
                             bool *outIsEntityIdRestriction);
 
 /* Scan iteration helpers */
-static void executeQualList(ForeignScanState *scanState, bool* updatedEntityIds);
+static void executeQualList(ForeignScanState *scanState, bool *updatedEntityIds);
 static void initQuery(TsfFdwExecState *state);
 static void resetQuery(TsfFdwExecState *state);
 static bool iterateWithRestrictions(TsfFdwExecState *state);
 static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *columnNulls);
-
 
 /* case insenstive string comapre */
 static int stricmp(char const *a, char const *b)
@@ -271,45 +256,63 @@ static int stricmp(char const *a, char const *b)
     if (d != 0 || !*a)
       return d;
   }
-  return -1; //should never be reached
+  return -1;  // should never be reached
 }
 
 /*
  * Convert a tsf_value_type to appropriate Postgres type
  */
-static const char* psqlTypeForTsfType(tsf_value_type type)
+static const char *psqlTypeForTsfType(tsf_value_type type)
 {
-  switch(type) {
-    case TypeInt32: return "integer";
-    case TypeInt64: return "bigint";
-    case TypeFloat32: return "real";
-    case TypeFloat64: return "double precision";
-    case TypeBool: return "boolean";
-    case TypeString: return "text";
-    case TypeEnum: return "text";
-    case TypeInt32Array: return "integer[]";
-    case TypeFloat32Array: return "real[]";
-    case TypeFloat64Array: return "double precision[]";
-    case TypeBoolArray: return "boolean[]";
-    case TypeStringArray: return "text[]";
-    case TypeEnumArray: return "text[]";
-    case TypeUnkown: return "";
+  switch (type) {
+    case TypeInt32:
+      return "integer";
+    case TypeInt64:
+      return "bigint";
+    case TypeFloat32:
+      return "real";
+    case TypeFloat64:
+      return "double precision";
+    case TypeBool:
+      return "boolean";
+    case TypeString:
+      return "text";
+    case TypeEnum:
+      return "text";
+    case TypeInt32Array:
+      return "integer[]";
+    case TypeFloat32Array:
+      return "real[]";
+    case TypeFloat64Array:
+      return "double precision[]";
+    case TypeBoolArray:
+      return "boolean[]";
+    case TypeStringArray:
+      return "text[]";
+    case TypeEnumArray:
+      return "text[]";
+    case TypeUnkown:
+      return "";
   }
 }
 
-static const char* fieldTypeLetter(tsf_field_type fieldType)
+static const char *fieldTypeLetter(tsf_field_type fieldType)
 {
-  switch(fieldType) {
-    case FieldLocusAttribute: return "l";
-    case FieldEntityAttribute: return "e";
-    case FieldMatrix: return "m";
-    default: return "";
+  switch (fieldType) {
+    case FieldLocusAttribute:
+      return "l";
+    case FieldEntityAttribute:
+      return "e";
+    case FieldMatrix:
+      return "m";
+    default:
+      return "";
   }
 }
 
 static void createTableSchema(stringbuilder *str, const char *prefix, const char *fileName,
-                                int sourceId, tsf_source *s, tsf_field_type fieldType,
-                                const char *tableSuffix)
+                              int sourceId, tsf_source *s, tsf_field_type fieldType,
+                              const char *tableSuffix)
 {
   char *buf = 0;
 
@@ -329,15 +332,17 @@ static void createTableSchema(stringbuilder *str, const char *prefix, const char
         if (fieldType == FieldMatrix)
           sb_append_str(str, ",\n       _entity_id integer");
       }
-      asprintf(&buf, ",\n       \"%s\" %s", s->fields[i].symbol, psqlTypeForTsfType(s->fields[i].value_type));
+      asprintf(&buf, ",\n       \"%s\" %s", s->fields[i].symbol,
+               psqlTypeForTsfType(s->fields[i].value_type));
       sb_append_str(str, buf);
       free(buf);
     }
   }
   if (foundOne) {
     sb_append_str(str, "\n       )\n       SERVER tsf_server\n");
-    const char* fieldTypeStr = fieldTypeLetter(fieldType);
-    asprintf(&buf, "       OPTIONS (filename '%s', sourceid '%d', fieldtype '%s');\n", fileName, sourceId, fieldTypeStr);
+    const char *fieldTypeStr = fieldTypeLetter(fieldType);
+    asprintf(&buf, "       OPTIONS (filename '%s', sourceid '%d', fieldtype '%s');\n", fileName,
+             sourceId, fieldTypeStr);
     sb_append_str(str, buf);
     free(buf);
   }
@@ -366,18 +371,17 @@ Datum tsf_generate_schemas(PG_FUNCTION_ARGS)
              errhint("TSF driver connection error: %s", tsf->errmsg)));
   }
 
-  stringbuilder* str = sb_new();
+  stringbuilder *str = sb_new();
 
-  for(int id = sourceId <= 0 ? 1 : sourceId;
-      id < (sourceId <= 0 ? tsf->source_count + 1 : sourceId + 1);
-      id++)
-  {
-    tsf_source* s = &tsf->sources[id - 1];
+  for (int id = sourceId <= 0 ? 1 : sourceId;
+       id < (sourceId <= 0 ? tsf->source_count + 1 : sourceId + 1);
+       id++) {
+    tsf_source *s = &tsf->sources[id - 1];
     createTableSchema(str, prefix, fileName, id, s, FieldLocusAttribute, "");
     createTableSchema(str, prefix, fileName, id, s, FieldMatrix, "_matrix");
     createTableSchema(str, prefix, fileName, id, s, FieldEntityAttribute, "_entity");
   }
-  text* ret = GET_TEXT(sb_cstring(str));
+  text *ret = GET_TEXT(sb_cstring(str));
   sb_destroy(str, true);
   tsf_close_file(tsf);
 
@@ -386,10 +390,9 @@ Datum tsf_generate_schemas(PG_FUNCTION_ARGS)
 
 // Backed process cache that outlives individual queries and holds open
 // TSF files by their name.
-typedef struct TsfHandleCache
-{
+typedef struct TsfHandleCache {
   tsf_file **tsfs;
-  char** tsfFileNames;
+  char **tsfFileNames;
   int count;
 } TsfHandleCache;
 
@@ -441,25 +444,25 @@ static tsf_file *tsfCacheOpen(const char *tsfFileName)
 /**
  * Find a matching TsfSourceState, or add one in executionState
  */
-static int getTsfSource(const char* tsfFileName, int sourceId, TsfFdwExecState *executionState)
+static int getTsfSource(const char *tsfFileName, int sourceId, TsfFdwExecState *executionState)
 {
-  for(int i=0; i<executionState->sourceCount; i++) {
-    if(strcmp(tsfFileName, executionState->sources[i].fileName) == 0) {
-      if(sourceId == executionState->sources[i].sourceId)
+  for (int i = 0; i < executionState->sourceCount; i++) {
+    if (strcmp(tsfFileName, executionState->sources[i].fileName) == 0) {
+      if (sourceId == executionState->sources[i].sourceId)
         return i;
     }
   }
   Assert(sourceId <= tsf->source_count);
 
-  TsfSourceState* prev = executionState->sources;
-  executionState->sources = palloc0(sizeof(TsfSourceState) * (executionState->sourceCount+1));
-  if(executionState->sourceCount > 0){
+  TsfSourceState *prev = executionState->sources;
+  executionState->sources = palloc0(sizeof(TsfSourceState) * (executionState->sourceCount + 1));
+  if (executionState->sourceCount > 0) {
     memcpy(executionState->sources, prev, sizeof(TsfSourceState) * executionState->sourceCount);
     pfree(prev);
   }
-  int sourceIdx =   executionState->sourceCount;
+  int sourceIdx = executionState->sourceCount;
   executionState->sourceCount++;
-  TsfSourceState* s = &executionState->sources[sourceIdx];
+  TsfSourceState *s = &executionState->sources[sourceIdx];
   s->fileName = tsfFileName;
   s->sourceId = sourceId;
   s->tsf = tsfCacheOpen(tsfFileName);
@@ -470,12 +473,12 @@ static int getTsfSource(const char* tsfFileName, int sourceId, TsfFdwExecState *
  * Exit callbakc function to clean up our tsfHandleCache, closing all
  * open file handles etc
  */
-static void
-tsfFdwExit(int code, Datum arg)
+static void tsfFdwExit(int code, Datum arg)
 {
-  if(!tsfHandleCache) return;
+  if (!tsfHandleCache)
+    return;
 
-  for(int i=0; i < tsfHandleCache->count; i++) {
+  for (int i = 0; i < tsfHandleCache->count; i++) {
     tsf_close_file(tsfHandleCache->tsfs[i]);
     pfree(tsfHandleCache->tsfFileNames[i]);
   }
@@ -496,12 +499,12 @@ void _PG_init(void)
   on_proc_exit(&tsfFdwExit, PointerGetDatum(NULL));
 }
 
-
 /*
  * tsf_fdw_handler creates and returns a struct with pointers to foreign table
  * callback functions.
  */
-Datum tsf_fdw_handler(PG_FUNCTION_ARGS) {
+Datum tsf_fdw_handler(PG_FUNCTION_ARGS)
+{
   FdwRoutine *fdwRoutine = makeNode(FdwRoutine);
 
   fdwRoutine->GetForeignRelSize = TsfGetForeignRelSize;
@@ -518,12 +521,12 @@ Datum tsf_fdw_handler(PG_FUNCTION_ARGS) {
   PG_RETURN_POINTER(fdwRoutine);
 }
 
-
 /*
  * buildOptionNamesString finds all options that are valid for the current context,
  * and concatenates these option names in a comma separated string.
  */
-static StringInfo buildOptionNamesString(Oid currentContextId) {
+static StringInfo buildOptionNamesString(Oid currentContextId)
+{
   StringInfo optionNamesString = makeStringInfo();
   bool firstOptionPrinted = false;
 
@@ -550,7 +553,8 @@ static StringInfo buildOptionNamesString(Oid currentContextId) {
  * foreign data wrapper, server, user mapping, or foreign table. This function
  * errors out if the given option name or its value is considered invalid.
  */
-Datum tsf_fdw_validator(PG_FUNCTION_ARGS) {
+Datum tsf_fdw_validator(PG_FUNCTION_ARGS)
+{
   int32 sourceId = -1;
 
   Datum optionArray = PG_GETARG_DATUM(0);
@@ -580,14 +584,13 @@ Datum tsf_fdw_validator(PG_FUNCTION_ARGS) {
 
       ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
                       errmsg("invalid option \"%s\"", optionName),
-                      errhint("Valid options in this context are: %s",
-                              optionNamesString->data)));
+                      errhint("Valid options in this context are: %s", optionNamesString->data)));
     }
 
     if (strncmp(optionName, OPTION_NAME_SOURCEID, NAMEDATALEN) == 0) {
       char *optionValue = defGetString(optionDef);
       sourceId = pg_atoi(optionValue, sizeof(int32), 0);
-      (void) sourceId; // remove warning
+      (void)sourceId;  // remove warning
     }
 
     if (strncmp(optionName, OPTION_NAME_FIELDTYPE, NAMEDATALEN) == 0) {
@@ -606,18 +609,15 @@ Datum tsf_fdw_validator(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-
 /*
  * TsfGetForeignRelSize obtains relation size estimates for tsf foreign table.
  */
-static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
-                                 Oid foreignTableId) {
-
+static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId)
+{
   TsfFdwOptions *tsfFdwOptions = getTsfFdwOptions(foreignTableId);
-  const char* tsfFileName = strJoin(tsfFdwOptions->path, tsfFdwOptions->filename, '\0');
+  const char *tsfFileName = strJoin(tsfFdwOptions->path, tsfFdwOptions->filename, '\0');
   tsf_file *tsf = tsfCacheOpen(tsfFileName);
-  if(tsfFdwOptions->sourceId < 1 ||
-     tsfFdwOptions->sourceId > tsf->source_count) {
+  if (tsfFdwOptions->sourceId < 1 || tsfFdwOptions->sourceId > tsf->source_count) {
     ereport(ERROR,
             (errmsg("Invalid source id %s:%d", tsfFdwOptions->filename, tsfFdwOptions->sourceId),
              errhint("There are %d sources in the TSF", tsf->source_count)));
@@ -628,13 +628,13 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
    * We use PgFdwRelationInfo to pass various information to subsequent
    * functions.
    */
-  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *) palloc0(sizeof(TsfFdwRelationInfo));
-  baserel->fdw_private = (void *) fpinfo;
-  fpinfo->columnList = columnList(baserel); //Extract used fields only
+  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *)palloc0(sizeof(TsfFdwRelationInfo));
+  baserel->fdw_private = (void *)fpinfo;
+  fpinfo->columnList = columnList(baserel);  // Extract used fields only
   fpinfo->width = list_length(fpinfo->columnList);
 
   // matrix should be entity_count * locus_count
-  switch(tsfFdwOptions->fieldType) {
+  switch (tsfFdwOptions->fieldType) {
     case FieldEntityAttribute:
       fpinfo->row_count = tsfSource->entity_count;
       fpinfo->rows_with_param_id = fpinfo->row_count;
@@ -649,11 +649,12 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
       fpinfo->is_matrix_source = true;
       fpinfo->rows_with_param_entity_id = tsfSource->locus_count;
       break;
-    default:
-    {
-      ereport(ERROR,
-              (errmsg("Invalid field type specified %s:%d", tsfFdwOptions->filename, tsfFdwOptions->sourceId),
-               errhint("The fieldtype option to the tsf_fdw tables must be set to 'l', 'm', or 'e'")));
+    default: {
+      ereport(
+          ERROR,
+          (errmsg("Invalid field type specified %s:%d", tsfFdwOptions->filename,
+                  tsfFdwOptions->sourceId),
+           errhint("The fieldtype option to the tsf_fdw tables must be set to 'l', 'm', or 'e'")));
     }
   }
 
@@ -662,10 +663,12 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   fpinfo->rows_selected = clamp_row_est(fpinfo->row_count * rowSelectivity);
   baserel->rows = fpinfo->rows_selected;
 
-  //elog(INFO, "%s[%d][%d], rowCount %d, rowSelectivity: %f, clamped: %f", __func__, tsfFdwOptions->sourceId, tsfFdwOptions->fieldType, fpinfo->row_count, rowSelectivity, fpinfo->rows_selected);
+  // elog(INFO, "%s[%d][%d], rowCount %d, rowSelectivity: %f, clamped: %f", __func__,
+  // tsfFdwOptions->sourceId, tsfFdwOptions->fieldType, fpinfo->row_count, rowSelectivity,
+  // fpinfo->rows_selected);
 }
 
-static bool exprVarNameMatch(Expr* expr, Oid foreignTableId, PlannerInfo *root, const char* name)
+static bool exprVarNameMatch(Expr *expr, Oid foreignTableId, PlannerInfo *root, const char *name)
 {
   if (nodeTag(expr) == T_Var) {
     Var *var = (Var *)expr;
@@ -689,9 +692,9 @@ static bool exprVarNameMatch(Expr* expr, Oid foreignTableId, PlannerInfo *root, 
  * BY), filters and joins there may be other paths we can directly
  * internalize.
  */
-static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
-                               Oid foreignTableId) {
-  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *) baserel->fdw_private;
+static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId)
+{
+  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *)baserel->fdw_private;
 
   /*
    * We skip reading columns that are not in query. Here we assume that all
@@ -738,7 +741,8 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
       /*
        * Any other pathkeys are not internalizable, so reset.
        */
-      //elog(INFO, "[%f] Found NON usable pathkeys %s [%s]", baserel->rows, nodeToString(pathkey_ec), nodeToString(usable_pathkeys));
+      // elog(INFO, "[%f] Found NON usable pathkeys %s [%s]", baserel->rows,
+      // nodeToString(pathkey_ec), nodeToString(usable_pathkeys));
       list_free(usable_pathkeys);
       usable_pathkeys = NIL;
       break;
@@ -749,7 +753,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
   if (usable_pathkeys != NULL) {
     // No different cost for including these pathkeys, since we are
     // inherently sorted by _id, _entity_id
-    //elog(INFO, "[%f] Found %d usable pathkeys", baserel->rows, list_length(usable_pathkeys));
+    // elog(INFO, "[%f] Found %d usable pathkeys", baserel->rows, list_length(usable_pathkeys));
     add_path(baserel, (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
                                                       totalCost, usable_pathkeys, NULL, NIL));
   }
@@ -769,10 +773,9 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
    * insists that we handle all movable clauses).
    */
   List *ppi_list = NIL;
-  foreach(lc, baserel->joininfo)
-  {
-    RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-    Relids		required_outer;
+  foreach (lc, baserel->joininfo) {
+    RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
+    Relids required_outer;
     ParamPathInfo *param_info;
 
     /* Check if clause can be moved to this rel */
@@ -784,12 +787,11 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
      * _entity_id = $
      */
     bool isEntityIdRestriction = false;
-    if(!isParamatizable(foreignTableId, baserel, rinfo->clause, &isEntityIdRestriction))
+    if (!isParamatizable(foreignTableId, baserel, rinfo->clause, &isEntityIdRestriction))
       continue;
 
     /* Calculate required outer rels for the resulting path */
-    required_outer = bms_union(rinfo->clause_relids,
-                               baserel->lateral_relids);
+    required_outer = bms_union(rinfo->clause_relids, baserel->lateral_relids);
     /* We do not want the foreign rel itself listed in required_outer */
     required_outer = bms_del_member(required_outer, baserel->relid);
 
@@ -801,8 +803,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
       continue;
 
     /* Get the ParamPathInfo */
-    param_info = get_baserel_parampathinfo(root, baserel,
-                                           required_outer);
+    param_info = get_baserel_parampathinfo(root, baserel, required_outer);
     Assert(param_info != NULL);
 
     /*
@@ -811,21 +812,21 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
      */
     int prev_length = list_length(ppi_list);
     ppi_list = list_append_unique_ptr(ppi_list, param_info);
-    if(list_length(ppi_list) > prev_length) {
-      double rows_selected = 1; //for _id on non-matrix
-      if(fpinfo->is_matrix_source) {
-        if(isEntityIdRestriction)
+    if (list_length(ppi_list) > prev_length) {
+      double rows_selected = 1;  // for _id on non-matrix
+      if (fpinfo->is_matrix_source) {
+        if (isEntityIdRestriction)
           rows_selected = fpinfo->rows_with_param_entity_id;
         else
           rows_selected = fpinfo->rows_with_param_id;
       }
 
       totalCost = (rows_selected * fpinfo->width) + startupCost;
-      add_path(baserel, (Path *)create_foreignscan_path(
-                 root, baserel, rows_selected, startupCost, totalCost,
-                 NIL,                       /* no pathkeys */
-                 param_info->ppi_req_outer, /* paramaterized path */
-                 NIL)                       /* no fdw_private list */
+      add_path(baserel,
+               (Path *)create_foreignscan_path(root, baserel, rows_selected, startupCost, totalCost,
+                                               NIL,                       /* no pathkeys */
+                                               param_info->ppi_req_outer, /* paramaterized path */
+                                               NIL)                       /* no fdw_private list */
                );
     }
   }
@@ -860,7 +861,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
         break;
       }
 
-      ListCell   *lc;
+      ListCell *lc;
 
       /* Scan the extracted join clauses */
       foreach (lc, clauses) {
@@ -876,9 +877,9 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
          * _id = $
          * _entity_id = $
          */
-        //elog(INFO, "join clause: %s", nodeToString(rinfo->clause));
+        // elog(INFO, "join clause: %s", nodeToString(rinfo->clause));
         bool isEntityIdRestriction = false;
-        if(!isParamatizable(foreignTableId, baserel, rinfo->clause, &isEntityIdRestriction))
+        if (!isParamatizable(foreignTableId, baserel, rinfo->clause, &isEntityIdRestriction))
           continue;
 
         /* Calculate required outer rels for the resulting path */
@@ -894,24 +895,23 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
         /* Add it to list unless we already have it */
         int prev_length = list_length(ppi_list);
         ppi_list = list_append_unique_ptr(ppi_list, param_info);
-        if(list_length(ppi_list) > prev_length) {
-          double rows_selected = 1; //for _id on non-matrix
-          if(fpinfo->is_matrix_source) {
-            if(isEntityIdRestriction)
+        if (list_length(ppi_list) > prev_length) {
+          double rows_selected = 1;  // for _id on non-matrix
+          if (fpinfo->is_matrix_source) {
+            if (isEntityIdRestriction)
               rows_selected = fpinfo->rows_with_param_entity_id;
             else
               rows_selected = fpinfo->rows_with_param_id;
           }
 
           totalCost = (rows_selected * fpinfo->width) + startupCost;
-          add_path(baserel, (Path *)create_foreignscan_path(
-                     root, baserel, rows_selected, startupCost, totalCost,
-                     NIL,                       /* no pathkeys */
-                     param_info->ppi_req_outer, /* paramaterized path */
-                     NIL)                       /* no fdw_private list */
+          add_path(baserel,
+                   (Path *)create_foreignscan_path(
+                       root, baserel, rows_selected, startupCost, totalCost, NIL, /* no pathkeys */
+                       param_info->ppi_req_outer, /* paramaterized path */
+                       NIL)                       /* no fdw_private list */
                    );
         }
-
       }
 
       /* Try again, now ignoring the expression we found this time */
@@ -926,10 +926,10 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
  * list, because we need it later for skipping over unused columns in the
  * query.
  */
-static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
-                                      Oid foreignTableId, ForeignPath *bestPath,
-                                      List *targetList, List *scanClauses) {
-  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *) baserel->fdw_private;
+static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
+                                      ForeignPath *bestPath, List *targetList, List *scanClauses)
+{
+  TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *)baserel->fdw_private;
   Index scanRangeTableIndex = baserel->relid;
   List *localExprs = NIL;
   List *tsfExprs = NIL;
@@ -953,32 +953,31 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
     List *quals = NIL;
     extractRestrictions(baserel->relids, rinfo->clause, &quals);
 
-    if(list_length(quals) == 1) {
+    if (list_length(quals) == 1) {
       MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
       // ID restrictions must be only internalized expressions if they
       // are found. Otherwise we can have any number of internalizable
       // restriction expressions.
-      if (!tsfExprs &&
-          isIdRestriction(foreignTableId, qual)) {
+      if (!tsfExprs && isIdRestriction(foreignTableId, qual)) {
         tsfExprs = lappend(tsfExprs, rinfo->clause);
         foundIdRestriction = true;
       } else if (isEntityIdRestriction(foreignTableId, qual)) {
-        entityIdClause = rinfo->clause; // Compatible with ID restrictions, so don't set tsfExprs
-      } else if (!foundIdRestriction &&
-                 isInternableRestriction(foreignTableId, qual)) {
+        entityIdClause = rinfo->clause;  // Compatible with ID restrictions, so don't set tsfExprs
+      } else if (!foundIdRestriction && isInternableRestriction(foreignTableId, qual)) {
         tsfExprs = lappend(tsfExprs, rinfo->clause);
       } else {
-        localExprs = lappend(localExprs, rinfo->clause); //We don't hanle
+        localExprs = lappend(localExprs, rinfo->clause);  // We don't hanle
       }
     } else {
       // Wasn't able to extract these restrictions...
       localExprs = lappend(localExprs, rinfo->clause);
     }
   }
-  if(entityIdClause)
+  if (entityIdClause)
     tsfExprs = lappend(tsfExprs, entityIdClause);
 
-  //elog(INFO, "[%f] extracted %d TSF, %d local quals", baserel->rows, list_length(tsfExprs), list_length(localExprs));
+  // elog(INFO, "[%f] extracted %d TSF, %d local quals", baserel->rows, list_length(tsfExprs),
+  // list_length(localExprs));
   /*
    * As an optimization, we only read columns that are present in the
    * query.  We already extracted those columns and placed them in
@@ -989,7 +988,6 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
    */
   List *foreignPrivateList = NIL;
   foreignPrivateList = list_make1(fpinfo->columnList);
-
 
   /* create the foreign scan node */
   ForeignScan *foreignScan = NULL;
@@ -1004,14 +1002,14 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 /*
  * TsfExplainForeignScan produces extra output for the Explain command.
  */
-static void TsfExplainForeignScan(ForeignScanState *scanState,
-                                  ExplainState *explainState) {
+static void TsfExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState)
+{
   Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
   TsfFdwOptions *tsfFdwOptions = getTsfFdwOptions(foreignTableId);
 
   ExplainPropertyText("TSF File", tsfFdwOptions->filename, explainState);
-  if(tsfFdwOptions->path)
-      ExplainPropertyText("TSF Path", tsfFdwOptions->path, explainState);
+  if (tsfFdwOptions->path)
+    ExplainPropertyText("TSF Path", tsfFdwOptions->path, explainState);
   ExplainPropertyLong("TSF Source ID", tsfFdwOptions->sourceId, explainState);
   ExplainPropertyText("TSF Field Type", fieldTypeLetter(tsfFdwOptions->fieldType), explainState);
 
@@ -1021,8 +1019,7 @@ static void TsfExplainForeignScan(ForeignScanState *scanState,
 
     int statResult = stat(tsfFdwOptions->filename, &statBuffer);
     if (statResult == 0) {
-      ExplainPropertyLong("TSF File Size", (long)statBuffer.st_size,
-                          explainState);
+      ExplainPropertyLong("TSF File Size", (long)statBuffer.st_size, explainState);
     }
   }
 }
@@ -1031,8 +1028,8 @@ static void TsfExplainForeignScan(ForeignScanState *scanState,
  * TsfBeginForeignScan opens the TSF file. Does not validate the query
  * yet, that happens of the first iteration.
  */
-static void TsfBeginForeignScan(ForeignScanState *scanState,
-                                int executorFlags) {
+static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags)
+{
   /* From FDW docs:
    *
    * Begin executing a foreign scan. This is called during executor startup.
@@ -1062,9 +1059,9 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   TsfFdwOptions *tsfFdwOptions = getTsfFdwOptions(foreignTableId);
 
   /* create column mapping */
-  ForeignScan* foreignScan = (ForeignScan *)scanState->ss.ps.plan;
+  ForeignScan *foreignScan = (ForeignScan *)scanState->ss.ps.plan;
 
-  List* foreignPrivateList = foreignScan->fdw_private;
+  List *foreignPrivateList = foreignScan->fdw_private;
   Assert(list_length(foreignPrivateList) == 1);
 
   List *columnList = (List *)linitial(foreignPrivateList);
@@ -1076,16 +1073,16 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
   buildColumnMapping(foreignTableId, columnList, tsfFdwOptions, executionState);
 
   /* We extract the qual list, but execute it on first iteration through ForeingScan */
-  List* foreignExprs = foreignScan->fdw_exprs;
+  List *foreignExprs = foreignScan->fdw_exprs;
   ListCell *lc = NULL;
-  foreach(lc, foreignExprs)
-  {
+  foreach (lc, foreignExprs) {
     extractRestrictions(bms_make_singleton(foreignScan->scan.scanrelid),
-                        ((Expr *) lfirst(lc)),
+                        ((Expr *)lfirst(lc)),
                         &executionState->qualList);
   }
 
-  //elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId, tsfFdwOptions->fieldType, list_length(columnList), list_length(foreignExprs));
+  // elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId,
+  // tsfFdwOptions->fieldType, list_length(columnList), list_length(foreignExprs));
 
   scanState->fdw_state = (void *)executionState;
 }
@@ -1095,7 +1092,8 @@ static void TsfBeginForeignScan(ForeignScanState *scanState,
  * a PostgreSQL tuple, and stores the converted tuple into the ScanTupleSlot as
  * a virtual tuple.
  */
-static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
+static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState)
+{
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
@@ -1138,7 +1136,7 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     } else {
       state->idListIdx++;
       if (state->idListIdx < state->idListCount) {
-        if(tsf_iter_id(state->iter, state->idList[state->idListIdx])) {
+        if (tsf_iter_id(state->iter, state->idList[state->idListIdx])) {
           fillTupleSlot(state, columnValues, columnNulls);
           ExecStoreVirtualTuple(tupleSlot);
         }
@@ -1146,7 +1144,9 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
     }
   } else {
     // Debug output first and last iteration to see if tables are doing full table scans
-    //if(state->iter->cur_record_id < 0 || state->iter->cur_record_id >= state->iter->max_record_id - 1) elog(INFO, "[%d][%d] iterscan: %d [%d of %d]", state->sourceId, state->fieldType, state->iter->cur_record_id, state->iter->cur_entity_idx, state->iter->entity_count);
+    // if(state->iter->cur_record_id < 0 || state->iter->cur_record_id >= state->iter->max_record_id
+    // - 1) elog(INFO, "[%d][%d] iterscan: %d [%d of %d]", state->sourceId, state->fieldType,
+    // state->iter->cur_record_id, state->iter->cur_entity_idx, state->iter->entity_count);
 
     if (iterateWithRestrictions(state)) {
       fillTupleSlot(state, columnValues, columnNulls);
@@ -1164,12 +1164,14 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState) {
  * TsfEndForeignScan finishes scanning the foreign table, closes the cursor
  * and the connection to TSF, and reclaims scan related resources.
  */
-static void TsfEndForeignScan(ForeignScanState *scanState) {
+static void TsfEndForeignScan(ForeignScanState *scanState)
+{
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
 
   /* if we executed a query, reclaim tsf related resources */
   if (state != NULL) {
-    //elog(INFO, "entering function %s[%d][%d] %p %p", __func__, state->sourceId, state->fieldType, state, state->iter);
+    // elog(INFO, "entering function %s[%d][%d] %p %p", __func__, state->sourceId, state->fieldType,
+    // state, state->iter);
     tsf_iter_close(state->iter);
 
     for (int i = 0; i < state->columnCount; i++) {
@@ -1202,11 +1204,11 @@ static void TsfReScanForeignScan(ForeignScanState *scanState)
     if (scanState->ss.ps.chgParam != NULL) {
       bool updatedEntityIds = false;
       executeQualList(scanState, &updatedEntityIds);
-      state->iter->cur_entity_idx = -1; //Reset inner entity counter
-      if(updatedEntityIds) {
+      state->iter->cur_entity_idx = -1;  // Reset inner entity counter
+      if (updatedEntityIds) {
         // Reset iter and let it be re-opened in TsfIterateForeignScan
-        //with the updated entityIds as input params.
-        //elog(INFO, "reset entity id list");
+        // with the updated entityIds as input params.
+        // elog(INFO, "reset entity id list");
         resetQuery(state);
         tsf_iter_close(state->iter);
         state->iter = NULL;
@@ -1225,7 +1227,8 @@ static void TsfReScanForeignScan(ForeignScanState *scanState)
  * looks for the option with the given name. If found, the function returns the
  * option's value.
  */
-static char *getOptionValue(Oid foreignTableId, const char *optionName) {
+static char *getOptionValue(Oid foreignTableId, const char *optionName)
+{
   ForeignTable *foreignTable = NULL;
   ForeignServer *foreignServer = NULL;
   List *optionList = NIL;
@@ -1256,7 +1259,8 @@ static char *getOptionValue(Oid foreignTableId, const char *optionName) {
  * and querying TSF. To resolve these values, the function checks the
  * foreign table's options.
  */
-static TsfFdwOptions *getTsfFdwOptions(Oid foreignTableId) {
+static TsfFdwOptions *getTsfFdwOptions(Oid foreignTableId)
+{
   TsfFdwOptions *tsfFdwOptions = NULL;
   char *filename = NULL;
   char *path = NULL;
@@ -1293,7 +1297,8 @@ static TsfFdwOptions *getTsfFdwOptions(Oid foreignTableId) {
  * used in projections, joins, and filter clauses, de-duplicates these columns,
  * and returns them in a new list. This function is unchanged from mongo_fdw.
  */
-static List *columnList(RelOptInfo *baserel) {
+static List *columnList(RelOptInfo *baserel)
+{
   List *columnList = NIL;
   List *neededColumnList = NIL;
   AttrNumber columnIndex = 1;
@@ -1312,8 +1317,8 @@ static List *columnList(RelOptInfo *baserel) {
     List *clauseColumnList = NIL;
 
     /* recursively pull up any columns used in the restriction clause */
-    clauseColumnList = pull_var_clause(restrictClause, PVC_RECURSE_AGGREGATES,
-                                       PVC_RECURSE_PLACEHOLDERS);
+    clauseColumnList =
+        pull_var_clause(restrictClause, PVC_RECURSE_AGGREGATES, PVC_RECURSE_PLACEHOLDERS);
 
     neededColumnList = list_union(neededColumnList, clauseColumnList);
   }
@@ -1341,12 +1346,12 @@ static List *columnList(RelOptInfo *baserel) {
 }
 
 /* Join two strings into a new string using palloc */
-static char* strJoin(const char* left, const char* right, char joiner)
+static char *strJoin(const char *left, const char *right, char joiner)
 {
   bool use_joiner = joiner != '\0';
   int left_size = left ? strlen(left) : 0;
   int size = left_size + (use_joiner ? 1 : 0) + strlen(right) + 1;
-  char* joined = palloc0(size);
+  char *joined = palloc0(size);
   if (left) {
     memcpy(joined, left, left_size);
   }
@@ -1394,8 +1399,8 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
     }
 
     // Check for our per-field options that override table-level options
-    ListCell   *lc;
-    List* options = GetForeignColumnOptions(foreignTableId, columnId);
+    ListCell *lc;
+    List *options = GetForeignColumnOptions(foreignTableId, columnId);
     foreach (lc, options) {
       DefElem *def = (DefElem *)lfirst(lc);
       if (strcmp(def->defname, "filename") == 0) {
@@ -1453,20 +1458,18 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
     columnMapping->columnArrayTypeId = get_element_type(column->vartype);
   }
 
-  if(executionState->sourceCount == 0) {
+  if (executionState->sourceCount == 0) {
     // No source-based fields, oepn default file to drive iteration
-    getTsfSource(strJoin(tsfFdwOptions->path, tsfFdwOptions->filename, '\0'), tsfFdwOptions->sourceId, executionState);
+    getTsfSource(strJoin(tsfFdwOptions->path, tsfFdwOptions->filename, '\0'),
+                 tsfFdwOptions->sourceId, executionState);
   }
 }
-
 
 static bool isIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
 
-  if (stricmp(columnName, "_id") == 0 &&
-          strcmp(qual->opname, "=") == 0)
-  {
+  if (stricmp(columnName, "_id") == 0 && strcmp(qual->opname, "=") == 0) {
     // Scalar or useOr
     return !qual->isArray || qual->useOr;
   }
@@ -1477,9 +1480,7 @@ static bool isEntityIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
 
-  if (stricmp(columnName, "_entity_id") == 0 &&
-          strcmp(qual->opname, "=") == 0)
-  {
+  if (stricmp(columnName, "_entity_id") == 0 && strcmp(qual->opname, "=") == 0) {
     // Scalar or useOr
     return !qual->isArray || qual->useOr;
   }
@@ -1492,13 +1493,13 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
   // TODO: check if clause is a expression that TSF can handle internally.
   // For example:
   // tsf_variable <supported_operator> sub_expression
-  return false; // Not yet implemented
+  return false;  // Not yet implemented
 }
 
 /*
  * Returns true if given expr can be cheaply paramaterized (i.e. is _id = $ or _entity_id = $)
  */
-static bool isParamatizable(Oid foreignTableId, RelOptInfo * baserel, Expr * expr,
+static bool isParamatizable(Oid foreignTableId, RelOptInfo *baserel, Expr *expr,
                             bool *outIsEntityIdRestriction)
 {
   List *quals = NIL;
@@ -1517,15 +1518,15 @@ static bool isParamatizable(Oid foreignTableId, RelOptInfo * baserel, Expr * exp
   return false;
 }
 
-static void parseQualIntoIdList(int** idList, int* idListCount, bool isNull,
-                                bool isArray, Datum value)
+static void parseQualIntoIdList(int **idList, int *idListCount, bool isNull, bool isArray,
+                                Datum value)
 {
-  if(isNull){
+  if (isNull) {
     free(*idList);
-    *idList = calloc(sizeof(int), 1); // non used, but must be not-null
+    *idList = calloc(sizeof(int), 1);  // non used, but must be not-null
     *idListCount = 0;
-  }else if(!isNull && isArray ) {
-    ArrayType* array = DatumGetArrayTypeP(value);
+  } else if (!isNull && isArray) {
+    ArrayType *array = DatumGetArrayTypeP(value);
     Oid elmtype = ARR_ELEMTYPE(array);
     Datum *dvalues;
     bool *dnulls;
@@ -1534,21 +1535,20 @@ static void parseQualIntoIdList(int** idList, int* idListCount, bool isNull,
     bool elmbyval;
     char elmalign;
     get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
-    deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign,
-                      &dvalues, &dnulls, &nelems);
-    if(*idListCount != nelems) {
+    deconstruct_array(array, elmtype, elmlen, elmbyval, elmalign, &dvalues, &dnulls, &nelems);
+    if (*idListCount != nelems) {
       free(*idList);
       *idList = calloc(sizeof(int), nelems);
     }
     *idListCount = 0;
-    for(int i=0; i<nelems; i++) {
+    for (int i = 0; i < nelems; i++) {
       if (!dnulls[i]) {
         (*idList)[*idListCount] = DatumGetInt32(dvalues[i]);
         (*idListCount) += 1;
       }
     }
-  }else{
-    if(*idListCount != 1) {
+  } else {
+    if (*idListCount != 1) {
       free(*idList);
       *idList = calloc(sizeof(int), 1);
       *idListCount = 1;
@@ -1558,10 +1558,10 @@ static void parseQualIntoIdList(int** idList, int* idListCount, bool isNull,
   }
 }
 
-static void executeQualList(ForeignScanState *scanState, bool* updatedEntityIds)
+static void executeQualList(ForeignScanState *scanState, bool *updatedEntityIds)
 {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
-  ListCell   *lc;
+  ListCell *lc;
 
   ExprContext *econtext = scanState->ss.ps.ps_ExprContext;
 
@@ -1594,11 +1594,11 @@ static void executeQualList(ForeignScanState *scanState, bool* updatedEntityIds)
         state->idListIdx = -1;
         parseQualIntoIdList(&state->idList, &state->idListCount, isNull, qual->isArray, value);
       }
-      if (state->entityIdColumnIndex >= 0 &&
-          qual->varattno - 1 == state->entityIdColumnIndex) {
+      if (state->entityIdColumnIndex >= 0 && qual->varattno - 1 == state->entityIdColumnIndex) {
         // _entity_id qual
-        parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, isNull, qual->isArray, value);
-        if(updatedEntityIds)
+        parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, isNull, qual->isArray,
+                            value);
+        if (updatedEntityIds)
           *updatedEntityIds = true;
       }
     }
@@ -1620,7 +1620,7 @@ static void initQuery(TsfFdwExecState *state)
     }
     if (col->mappingSourceIdx >= 0) {
       TsfSourceState *mapping = &state->sources[col->mappingSourceIdx];
-      if(!mapping->mappingIter){
+      if (!mapping->mappingIter) {
         // Because a mapping source will be used by every field of the
         // source it is mapping to the primary table, and it only has a
         // single mapping field, we have the source own the mappingIter
@@ -1628,10 +1628,10 @@ static void initQuery(TsfFdwExecState *state)
         int fields[1];
         fields[0] = 0;  // mapping field is always 0 in mapping source
         tsf_field_type mappingFieldType =
-          state->fieldType == FieldEntityAttribute ? FieldEntityAttribute : FieldLocusAttribute;
+            state->fieldType == FieldEntityAttribute ? FieldEntityAttribute : FieldLocusAttribute;
 
-        mapping->mappingIter = tsf_query_table(mapping->tsf, mapping->sourceId, 1, fields, -1, NULL,
-                                               mappingFieldType);
+        mapping->mappingIter =
+            tsf_query_table(mapping->tsf, mapping->sourceId, 1, fields, -1, NULL, mappingFieldType);
         if (!mapping->mappingIter) {
           ereport(ERROR, (errmsg("Failed to start TSF mapping field table query"),
                           errhint("Query failed on mapping of field %d with source %s:%d",
@@ -1698,9 +1698,9 @@ static bool iterateWithRestrictions(TsfFdwExecState *state)
 }
 
 /* Sync iter to ref_iter */
-static void syncIter(tsf_iter* iter, tsf_iter* ref_iter)
+static void syncIter(tsf_iter *iter, tsf_iter *ref_iter)
 {
-  if(iter->is_matrix_iter)
+  if (iter->is_matrix_iter)
     tsf_iter_id_matrix(iter, ref_iter->cur_record_id, ref_iter->cur_entity_idx);
   else
     tsf_iter_id(iter, ref_iter->cur_record_id);
@@ -1710,7 +1710,9 @@ static void syncIter(tsf_iter* iter, tsf_iter* ref_iter)
  * Does the heavy lifting of reading through each value of a tsf arrya
  * type and create an array of Datum*.
  */
-static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int* outSize, Datum** outValueArray) {
+static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int *outSize,
+                                 Datum **outValueArray)
+{
   int size = va_size(value);
   Datum *columnValueArray = palloc0(size * sizeof(Datum));
   bool typeMatched = false;
@@ -1718,36 +1720,36 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
     case INT4OID:
       if (f->value_type == TypeInt32Array) {
         typeMatched = true;
-        for(int i=0; i< size; i++)
+        for (int i = 0; i < size; i++)
           columnValueArray[i] = Int32GetDatum(va_int32(value, i));
       }
       break;
     case FLOAT4OID:
       if (f->value_type == TypeFloat32Array) {
         typeMatched = true;
-        for(int i=0; i< size; i++)
+        for (int i = 0; i < size; i++)
           columnValueArray[i] = Float4GetDatum(va_float32(value, i));
       }
       break;
     case FLOAT8OID:
       if (f->value_type == TypeFloat64Array) {
         typeMatched = true;
-        for(int i=0; i< size; i++)
+        for (int i = 0; i < size; i++)
           columnValueArray[i] = Float8GetDatum(va_float64(value, i));
       }
       break;
     case BOOLOID:
       if (f->value_type == TypeBoolArray) {
         typeMatched = true;
-        for(int i=0; i< size; i++)
+        for (int i = 0; i < size; i++)
           columnValueArray[i] = BoolGetDatum(va_bool(value, i));
       }
       break;
     case TEXTOID:
       if (f->value_type == TypeStringArray) {
         typeMatched = true;
-        const char* s = va_array(value);
-        for(int i=0; i< size; i++) {
+        const char *s = va_array(value);
+        for (int i = 0; i < size; i++) {
           columnValueArray[i] = CStringGetTextDatum(s);
           // Advanced past next NULL
           while (s[0] != '\0')  // increment to next NULL
@@ -1756,9 +1758,9 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
         }
       } else if (f->value_type == TypeEnumArray) {
         typeMatched = true;
-        for(int i=0; i< size; i++) {
-          const char* s = va_enum_as_str(value, i, f->enum_names);
-          if(s)
+        for (int i = 0; i < size; i++) {
+          const char *s = va_enum_as_str(value, i, f->enum_names);
+          if (s)
             columnValueArray[i] = CStringGetTextDatum(s);
           else
             columnValueArray[i] = CStringGetTextDatum("");
@@ -1766,13 +1768,14 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
       }
       break;
     default:
-      break; // typeMatched will be false
+      break;  // typeMatched will be false
   }
-  if(!typeMatched) {
-    ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-                    errmsg("cannot convert tsf array type to column type"),
-                    errhint("Array value type: %u, Tsf type: %d", (uint32)valueTypeId, f->value_type)));
-    return; //NULL Datum
+  if (!typeMatched) {
+    ereport(ERROR,
+            (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+             errmsg("cannot convert tsf array type to column type"),
+             errhint("Array value type: %u, Tsf type: %d", (uint32)valueTypeId, f->value_type)));
+    return;  // NULL Datum
   }
   *outSize = size;
   *outValueArray = columnValueArray;
@@ -1784,7 +1787,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
  * to the corresponding PostgreSQL datum. Then, the function constructs an array
  * datum from element datums, and returns the array datum.
  */
-static Datum columnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId) {
+static Datum columnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId)
+{
   int size;
   Datum *columnValueArray;
   columnValueArrayData(value, f, valueTypeId, &size, &columnValueArray);
@@ -1793,8 +1797,8 @@ static Datum columnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId) {
   char typeAlignment = 0;
   int16 typeLength = 0;
   get_typlenbyvalalign(valueTypeId, &typeLength, &typeByValue, &typeAlignment);
-  ArrayType *columnValueObject = construct_array(columnValueArray, size, valueTypeId,
-                                      typeLength, typeByValue, typeAlignment);
+  ArrayType *columnValueObject =
+      construct_array(columnValueArray, size, valueTypeId, typeLength, typeByValue, typeAlignment);
 
   return PointerGetDatum(columnValueObject);
 }
@@ -1846,14 +1850,14 @@ static Datum columnValue(tsf_v value, tsf_field *f, Oid columnTypeId)
       break;
     }
     default: {
-      break; //Any fallthrough generates an error
+      break;  // Any fallthrough generates an error
     }
   }
   ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
                   errmsg("cannot convert tsf type to column type"),
                   errhint("Column type: %u, Tsf type: %d", (uint32)columnTypeId, f->value_type)));
 
-  return 0; //NULL Datum
+  return 0;  // NULL Datum
 }
 
 /*
@@ -1879,9 +1883,8 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
       bool typeByValue = false;
       char typeAlignment = 0;
       int16 typeLength = 0;
-      if(OidIsValid(columnArrayTypeId))
-         get_typlenbyvalalign(columnArrayTypeId, &typeLength, &typeByValue, &typeAlignment);
-
+      if (OidIsValid(columnArrayTypeId))
+        get_typlenbyvalalign(columnArrayTypeId, &typeLength, &typeByValue, &typeAlignment);
 
       syncIter(col->mappingIter, state->iter);
       tsf_field *mf = col->mappingIter->fields[0];
@@ -1908,7 +1911,8 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
         for (int i = 0; i < size; i++) {
           // Read the ID at 'i' in the mapping field
           if (col->iter->is_matrix_iter)
-            tsf_iter_id_matrix(col->iter, va_int32(col->mappingIter->cur_values[0], i), state->iter->cur_entity_idx);
+            tsf_iter_id_matrix(col->iter, va_int32(col->mappingIter->cur_values[0], i),
+                               state->iter->cur_entity_idx);
           else
             tsf_iter_id(col->iter, va_int32(col->mappingIter->cur_values[0], i));
           tsf_v value = col->iter->cur_values[0];
@@ -1956,7 +1960,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
             int k = 0;
             for (int i = 0; i < size; i++) {
               int elemSize = sizes[i];
-              Datum *innerArray = (Datum*)DatumGetPointer(elements[i]);
+              Datum *innerArray = (Datum *)DatumGetPointer(elements[i]);
               for (int j = 0; j < maxSubElementSize; j++) {
                 if (j < elemSize)
                   elems[k] = innerArray[j];

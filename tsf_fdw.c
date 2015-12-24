@@ -1925,7 +1925,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
             int lbs[1];
             dims[0] = size;
             lbs[0] = 1;
-            bool *nulls = palloc(size * sizeof(bool));
+            bool *nulls = palloc0(size * sizeof(bool));
             for (int i = 0; i < size; i++)
               nulls[i] = true;
             ArrayType *array = construct_md_array(NULL, nulls, 1, dims, lbs, columnArrayTypeId,
@@ -1967,7 +1967,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
           int lbs[1];
           dims[0] = size;
           lbs[0] = 1;
-          bool *nulls = palloc(size * sizeof(bool));
+          bool *nulls = palloc0(size * sizeof(bool));
           for (int i = 0; i < size; i++)
             if (!elements[i])  // NULL Datum is our null sentinal
               nulls[i] = true;

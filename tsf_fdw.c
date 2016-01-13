@@ -712,7 +712,10 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid forei
   ForeignPath *path;
   path = create_foreignscan_path(root, baserel, baserel->rows, startupCost, totalCost,
                                  NIL,  /* no pathkeys */
-                                 NULL, /* not parameterized */
+                                 NULL, /* no outer rel */
+#if PG_VERSION_NUM >= 90500
+                                 NULL, /* no extra plan */
+#endif
                                  NIL); /* no fdw_private */
 
   add_path(baserel, (Path *)path);
@@ -755,7 +758,12 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid forei
     // inherently sorted by _id, _entity_id
     // elog(INFO, "[%f] Found %d usable pathkeys", baserel->rows, list_length(usable_pathkeys));
     add_path(baserel, (Path *)create_foreignscan_path(root, baserel, baserel->rows, startupCost,
-                                                      totalCost, usable_pathkeys, NULL, NIL));
+                                                      totalCost, usable_pathkeys,
+                                                      NULL,
+#if PG_VERSION_NUM >= 90500
+                                                      NULL,
+#endif
+                                                      NIL));
   }
 
   /*
@@ -826,6 +834,9 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid forei
                (Path *)create_foreignscan_path(root, baserel, rows_selected, startupCost, totalCost,
                                                NIL,                       /* no pathkeys */
                                                param_info->ppi_req_outer, /* paramaterized path */
+#if PG_VERSION_NUM >= 90500
+                                               NULL,
+#endif
                                                NIL)                       /* no fdw_private list */
                );
     }
@@ -909,6 +920,9 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid forei
                    (Path *)create_foreignscan_path(
                        root, baserel, rows_selected, startupCost, totalCost, NIL, /* no pathkeys */
                        param_info->ppi_req_outer, /* paramaterized path */
+#if PG_VERSION_NUM >= 90500
+                       NULL, /* no extra plan */
+#endif
                        NIL)                       /* no fdw_private list */
                    );
         }
@@ -995,7 +1009,12 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
                                  localExprs, /* postgres will run these restrictions on results */
                                  scanRangeTableIndex,
                                  tsfExprs,
-                                 foreignPrivateList);
+                                 foreignPrivateList
+#if PG_VERSION_NUM >= 90500
+                                 , NULL, NULL, NULL /* No remote expressions or outer plan */
+#endif
+
+                                 );
   return foreignScan;
 }
 

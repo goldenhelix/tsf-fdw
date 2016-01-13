@@ -488,7 +488,13 @@ void findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int 
         ppi->ppi_rows = nbrows;
         ppi->ppi_clauses = list_concat(ppi->ppi_clauses, allclauses);
         foreignPath = create_foreignscan_path(root, baserel, nbrows, startupCost,
-                                              nbrows * baserel->width, NIL, NULL, NULL);
+                                              nbrows * baserel->width,
+                                              NIL,
+                                              NULL,
+#if PG_VERSION_NUM >= 90500
+                                              NULL,
+#endif
+                                              NULL);
 
         foreignPath->path.param_info = ppi;
         add_path(baserel, (Path *)foreignPath);

@@ -28,6 +28,7 @@
 #define OPTION_NAME_SOURCEID "sourceid"
 #define OPTION_NAME_FIELDTYPE "fieldtype"
 #define OPTION_NAME_FIELDIDX "fieldidx"
+#define OPTION_NAME_MAPPINGFILENAME "mappingfilename"
 #define OPTION_NAME_MAPPINGID "mappingid"
 
 #define POSTGRES_TO_UNIX_EPOCH_DAYS (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE)
@@ -45,7 +46,7 @@ typedef struct TsfValidOption {
 } TsfValidOption;
 
 /* Array of options that are valid for tsf_fdw */
-static const uint32 ValidOptionCount = 8;
+static const uint32 ValidOptionCount = 9;
 static const TsfValidOption ValidOptionArray[] = {
     /* foreign table options */
     {OPTION_NAME_FILENAME, ForeignTableRelationId},
@@ -56,6 +57,7 @@ static const TsfValidOption ValidOptionArray[] = {
     {OPTION_NAME_FILENAME, AttributeRelationId},
     {OPTION_NAME_SOURCEID, AttributeRelationId},
     {OPTION_NAME_FIELDIDX, AttributeRelationId},
+    {OPTION_NAME_MAPPINGFILENAME, AttributeRelationId},
     {OPTION_NAME_MAPPINGID, AttributeRelationId},
 };
 

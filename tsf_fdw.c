@@ -1445,9 +1445,6 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
     executionState->columnCount++;
 
     const char *tsfFileName = strJoin(tsfFdwOptions->path, filename, '\0');  // use base path
-    columnMapping->sourceIdx = getTsfSource(tsfFileName, sourceId, executionState);
-    TsfSourceState *tsfSourceState = &executionState->sources[columnMapping->sourceIdx];
-    tsf_source *tsfSource = &tsfSourceState->tsf->sources[tsfSourceState->sourceId - 1];
 
     columnMapping->mappingSourceIdx = -1;
     if (mappingId >= 0) {
@@ -1457,6 +1454,10 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
         mappingFilename = tsfFileName; // By default, assume mapping source is in current TSF
       columnMapping->mappingSourceIdx = getTsfSource(mappingFilename, mappingId, executionState);
     }
+
+    columnMapping->sourceIdx = getTsfSource(tsfFileName, sourceId, executionState);
+    TsfSourceState *tsfSourceState = &executionState->sources[columnMapping->sourceIdx];
+    tsf_source *tsfSource = &tsfSourceState->tsf->sources[tsfSourceState->sourceId - 1];
 
     // Find this coloumn by its symbol name in the source if no fieldIdx provided
     if (fieldIdx < 0) {

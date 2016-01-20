@@ -1736,8 +1736,9 @@ static void syncIter(tsf_iter *iter, tsf_iter *ref_iter)
 }
 
 /*
- * Does the heavy lifting of reading through each value of a tsf arrya
- * type and create an array of Datum*.
+ * Does the heavy lifting of reading through each value of a tsf array
+ * type and create an array of Datum*. For elements with missing values,
+ * the Datum* will be NULL.
  */
 static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int *outSize,
                                  Datum **outValueArray)
@@ -1750,28 +1751,32 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
       if (f->value_type == TypeInt32Array) {
         typeMatched = true;
         for (int i = 0; i < size; i++)
-          columnValueArray[i] = Int32GetDatum(va_int32(value, i));
+          if(va_int32(value, i) != INT_MISSING)
+            columnValueArray[i] = Int32GetDatum(va_int32(value, i));
       }
       break;
     case FLOAT4OID:
       if (f->value_type == TypeFloat32Array) {
         typeMatched = true;
         for (int i = 0; i < size; i++)
-          columnValueArray[i] = Float4GetDatum(va_float32(value, i));
+          if(va_float32(value, i) != FLOAT_MISSING)
+            columnValueArray[i] = Float4GetDatum(va_float32(value, i));
       }
       break;
     case FLOAT8OID:
       if (f->value_type == TypeFloat64Array) {
         typeMatched = true;
         for (int i = 0; i < size; i++)
-          columnValueArray[i] = Float8GetDatum(va_float64(value, i));
+          if(va_float64(value, i) != DOUBLE_MISSING)
+            columnValueArray[i] = Float8GetDatum(va_float64(value, i));
       }
       break;
     case BOOLOID:
       if (f->value_type == TypeBoolArray) {
         typeMatched = true;
         for (int i = 0; i < size; i++)
-          columnValueArray[i] = BoolGetDatum(va_bool(value, i));
+          if(va_bool(value, i) != BOOL_MISSING)
+            columnValueArray[i] = BoolGetDatum(va_bool(value, i));
       }
       break;
     case TEXTOID:
@@ -1779,7 +1784,9 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
         typeMatched = true;
         const char *s = va_array(value);
         for (int i = 0; i < size; i++) {
-          columnValueArray[i] = CStringGetTextDatum(s);
+          bool isnull = s[0] == '\0' || (s[0] == '?' && s[1] == '\0');
+          if(!isnull)
+            columnValueArray[i] = CStringGetTextDatum(s);
           // Advanced past next NULL
           while (s[0] != '\0')  // increment to next NULL
             s++;
@@ -1791,8 +1798,6 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
           const char *s = va_enum_as_str(value, i, f->enum_names);
           if (s)
             columnValueArray[i] = CStringGetTextDatum(s);
-          else
-            columnValueArray[i] = CStringGetTextDatum("");
         }
       }
       break;
@@ -1826,8 +1831,25 @@ static Datum columnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId)
   char typeAlignment = 0;
   int16 typeLength = 0;
   get_typlenbyvalalign(valueTypeId, &typeLength, &typeByValue, &typeAlignment);
-  ArrayType *columnValueObject =
-      construct_array(columnValueArray, size, valueTypeId, typeLength, typeByValue, typeAlignment);
+
+  int dims[1];
+  int lbs[1];
+  dims[0] = size;
+  lbs[0] = 1;
+  bool *nulls = NULL;
+  for (int i = 0; i < size; i++) {
+    // Check for NULL Datums (which columnValueArray may contain for
+    // missing values inside our array fields). If we find any, on-demand
+    // build `nulls`. Otherwise nulls is not needed.
+    if (!columnValueArray[i]) {
+      if (!nulls)
+        nulls = palloc0(size * sizeof(bool));
+      nulls[i] = true;
+    }
+  }
+
+  ArrayType *columnValueObject = construct_md_array(
+      columnValueArray, nulls, 1, dims, lbs, valueTypeId, typeLength, typeByValue, typeAlignment);
 
   return PointerGetDatum(columnValueObject);
 }
@@ -1991,7 +2013,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
               int elemSize = sizes[i];
               Datum *innerArray = (Datum *)DatumGetPointer(elements[i]);
               for (int j = 0; j < maxSubElementSize; j++) {
-                if (j < elemSize)
+                if (j < elemSize && innerArray[j])
                   elems[k] = innerArray[j];
                 else
                   nulls[k] = true;

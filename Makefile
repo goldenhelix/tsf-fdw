@@ -7,8 +7,8 @@ MODULE_big = tsf_fdw
 
 TSF_DRIVER = tsf-c-1.0
 TSF_PATH = $(TSF_DRIVER)/src
-TSF_OBJS = $(TSF_PATH)/tsf.os \
-	$(TSF_PATH)/sqlite3/sqlite3.os \
+TSF_OBJS = $(TSF_PATH)/tsf.o \
+	$(TSF_PATH)/sqlite3/sqlite3.o \
 	$(TSF_PATH)/jansson/dump.o \
 	$(TSF_PATH)/jansson/error.o \
 	$(TSF_PATH)/jansson/hashtable.o \
@@ -23,15 +23,17 @@ TSF_OBJS = $(TSF_PATH)/tsf.os \
 	$(TSF_PATH)/blosc/blosclz.o \
 	$(TSF_PATH)/blosc/shuffle.o
 
-PG_CPPFLAGS = --std=c99 -ggdb -I$(TSF_PATH) -I$(TSF_PATH)/jansson -I$(TSF_PATH)/blosc
+
+#TIP: For debugging purposes, build like:
+#> OPTIMIZATION='-g' make
+OPTIMIZATION?=-O3
+
+PG_CPPFLAGS = --std=c99 -Wno-declaration-after-statement $(OPTIMIZATION) -I$(TSF_PATH) -I$(TSF_PATH)/jansson -I$(TSF_PATH)/blosc
 SHLIB_LINK = -lz
 OBJS = tsf_fdw.o query.o util.o stringbuilder.o $(TSF_OBJS)
 
 EXTENSION = tsf_fdw
 DATA = tsf_fdw--1.0.sql
-
-$(TSF_DRIVER)/%.os:
-	$(MAKE) -C $(TSF_DRIVER) $*.os
 
 #
 # Users need to specify their Postgres installation path through pg_config. For

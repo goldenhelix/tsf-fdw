@@ -218,7 +218,11 @@ static void TsfGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid for
 static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId);
 static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
                                       ForeignPath *bestPath, List *targetList,
-                                      List *restrictionClauses);
+                                      List *restrictionClauses
+#if PG_VERSION_NUM >= 90500
+                                      ,Plan *outer_plan
+#endif
+                                      );
 
 static void TsfExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState);
 static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags);
@@ -942,7 +946,11 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid forei
  * query.
  */
 static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
-                                      ForeignPath *bestPath, List *targetList, List *scanClauses)
+                                      ForeignPath *bestPath, List *targetList, List *scanClauses
+#if PG_VERSION_NUM >= 90500
+                                      ,Plan *outer_plan
+#endif
+                                      )
 {
   TsfFdwRelationInfo *fpinfo = (TsfFdwRelationInfo *)baserel->fdw_private;
   Index scanRangeTableIndex = baserel->relid;

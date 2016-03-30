@@ -292,6 +292,7 @@ static const char *psqlTypeForTsfType(tsf_value_type type)
     case TypeEnumArray:
       return "text[]";
     case TypeUnkown:
+    default:
       return "";
   }
 }
@@ -1397,6 +1398,8 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
   executionState->sourceCount = 0;
   executionState->idColumnIndex = -1;
   executionState->entityIdColumnIndex = -1;
+  executionState->entityIdListCount = 0; // Set based on sources we open
+  bool isMatrix = executionState->fieldType == FieldMatrix;
 
   foreach (columnCell, columnList) {
     char *filename = tsfFdwOptions->filename;
@@ -1458,6 +1461,14 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
     columnMapping->sourceIdx = getTsfSource(tsfFileName, sourceId, executionState);
     TsfSourceState *tsfSourceState = &executionState->sources[columnMapping->sourceIdx];
     tsf_source *tsfSource = &tsfSourceState->tsf->sources[tsfSourceState->sourceId - 1];
+    if(isMatrix) {
+      if(executionState->entityIdListCount == 0)
+        executionState->entityIdListCount = tsfSource->entity_count;
+      else if(executionState->entityIdListCount != tsfSource->entity_count)
+        ereport(ERROR,
+                (errmsg("Mismatched entity_count between multiple tsf sources utalized in query of matrix fields"),
+                 errhint("First observed entity_count: %d, vs %d", executionState->entityIdListCount, tsfSource->entity_count)));
+    }
 
     // Find this coloumn by its symbol name in the source if no fieldIdx provided
     if (fieldIdx < 0) {
@@ -1489,8 +1500,17 @@ static void buildColumnMapping(Oid foreignTableId, List *columnList, TsfFdwOptio
 
   if (executionState->sourceCount == 0) {
     // No source-based fields, oepn default file to drive iteration
-    getTsfSource(strJoin(tsfFdwOptions->path, tsfFdwOptions->filename, '\0'),
-                 tsfFdwOptions->sourceId, executionState);
+    int sourceIdx = getTsfSource(strJoin(tsfFdwOptions->path, tsfFdwOptions->filename, '\0'),
+                                 tsfFdwOptions->sourceId, executionState);
+    TsfSourceState *tsfSourceState = &executionState->sources[sourceIdx];
+    tsf_source *tsfSource = &tsfSourceState->tsf->sources[tsfSourceState->sourceId - 1];
+    if(isMatrix)
+      executionState->entityIdListCount = tsfSource->entity_count;
+  }
+  if (executionState->entityIdListCount > 0) {
+    executionState->entityIdList = malloc(sizeof(int) * executionState->entityIdListCount);
+    for (int i = 0; i < executionState->entityIdListCount; i++)
+      executionState->entityIdList[i] = i;
   }
 }
 

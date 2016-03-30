@@ -25,7 +25,7 @@ TSF_OBJS = $(TSF_PATH)/tsf.o \
 
 
 #TIP: For debugging purposes, build like:
-#> OPTIMIZATION='-g' make
+#> OPTIMIZATION='-g -O0' make
 OPTIMIZATION?=-O3
 
 PG_CPPFLAGS = --std=c99 -Wno-declaration-after-statement $(OPTIMIZATION) -I$(TSF_PATH) -I$(TSF_PATH)/jansson -I$(TSF_PATH)/blosc

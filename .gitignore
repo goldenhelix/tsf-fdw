@@ -1,2 +1,6 @@
-**.o
-**.so
+*.o
+*.so
+src/blosc/*.o
+src/jansson/*.o
+src/sqlite3/*.o
+src/*.o

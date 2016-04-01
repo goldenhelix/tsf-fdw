@@ -63,7 +63,7 @@ typedef struct MulticornBaseQual {
   Oid typeoid;
   char *opname;
   bool isArray;
-  bool useOr;
+  bool useOr; // ANY on array operators
 } MulticornBaseQual;
 
 typedef struct MulticornConstQual {

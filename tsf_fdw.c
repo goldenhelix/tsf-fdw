@@ -1763,6 +1763,13 @@ static void syncIter(tsf_iter *iter, tsf_iter *ref_iter)
     tsf_iter_id(iter, ref_iter->cur_record_id);
 }
 
+// We need a sentinal for a missing value other than NULL, which is a
+// valid value for many data types such as integer (value of 0). Since a
+// DATUM is just 8 bytes of data, any unexpected value would do, but we
+// use one that should never be used for INT type and non-sensical for
+// floating point types.
+#define DATUM_MISSING (Int32GetDatum(INT_MISSING))
+
 /*
  * Does the heavy lifting of reading through each value of a tsf array
  * type and create an array of Datum*. For elements with missing values,
@@ -1781,6 +1788,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
         for (int i = 0; i < size; i++)
           if(va_int32(value, i) != INT_MISSING)
             columnValueArray[i] = Int32GetDatum(va_int32(value, i));
+          else
+            columnValueArray[i] = DATUM_MISSING;
       }
       break;
     case FLOAT4OID:
@@ -1789,6 +1798,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
         for (int i = 0; i < size; i++)
           if(va_float32(value, i) != FLOAT_MISSING)
             columnValueArray[i] = Float4GetDatum(va_float32(value, i));
+          else
+            columnValueArray[i] = DATUM_MISSING;
       }
       break;
     case FLOAT8OID:
@@ -1797,6 +1808,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
         for (int i = 0; i < size; i++)
           if(va_float64(value, i) != DOUBLE_MISSING)
             columnValueArray[i] = Float8GetDatum(va_float64(value, i));
+          else
+            columnValueArray[i] = DATUM_MISSING;
       }
       break;
     case BOOLOID:
@@ -1805,6 +1818,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
         for (int i = 0; i < size; i++)
           if(va_bool(value, i) != BOOL_MISSING)
             columnValueArray[i] = BoolGetDatum(va_bool(value, i));
+          else
+            columnValueArray[i] = DATUM_MISSING;
       }
       break;
     case TEXTOID:
@@ -1815,6 +1830,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
           bool isnull = s[0] == '\0' || (s[0] == '?' && s[1] == '\0');
           if(!isnull)
             columnValueArray[i] = CStringGetTextDatum(s);
+          else
+            columnValueArray[i] = DATUM_MISSING;
           // Advanced past next NULL
           while (s[0] != '\0')  // increment to next NULL
             s++;
@@ -1826,6 +1843,8 @@ static void columnValueArrayData(tsf_v value, tsf_field *f, Oid valueTypeId, int
           const char *s = va_enum_as_str(value, i, f->enum_names);
           if (s)
             columnValueArray[i] = CStringGetTextDatum(s);
+          else
+            columnValueArray[i] = DATUM_MISSING;
         }
       }
       break;
@@ -1866,10 +1885,10 @@ static Datum columnValueArray(tsf_v value, tsf_field *f, Oid valueTypeId)
   lbs[0] = 1;
   bool *nulls = NULL;
   for (int i = 0; i < size; i++) {
-    // Check for NULL Datums (which columnValueArray may contain for
-    // missing values inside our array fields). If we find any, on-demand
-    // build `nulls`. Otherwise nulls is not needed.
-    if (!columnValueArray[i]) {
+    // Check for our NULL sentinal Datums (which columnValueArray may
+    // contain for missing values inside our array fields). If we find
+    // any, on-demand build `nulls`. Otherwise nulls is not needed.
+    if (columnValueArray[i] == DATUM_MISSING) {
       if (!nulls)
         nulls = palloc0(size * sizeof(bool));
       nulls[i] = true;
@@ -2008,6 +2027,8 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
           } else {
             if (!is_null)
               elements[i] = columnValue(value, f, columnArrayTypeId);
+            else
+              elements[i] = DATUM_MISSING;
           }
         }
 
@@ -2041,7 +2062,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
               int elemSize = sizes[i];
               Datum *innerArray = (Datum *)DatumGetPointer(elements[i]);
               for (int j = 0; j < maxSubElementSize; j++) {
-                if (j < elemSize && innerArray[j])
+                if (j < elemSize && innerArray[j] != DATUM_MISSING)
                   elems[k] = innerArray[j];
                 else
                   nulls[k] = true;
@@ -2062,7 +2083,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
           lbs[0] = 1;
           bool *nulls = palloc0(size * sizeof(bool));
           for (int i = 0; i < size; i++)
-            if (!elements[i])  // NULL Datum is our null sentinal
+            if (elements[i] == DATUM_MISSING)  // Check for our null sentinal
               nulls[i] = true;
           ArrayType *array = construct_md_array(elements, nulls, 1, dims, lbs, columnArrayTypeId,
                                                 typeLength, typeByValue, typeAlignment);

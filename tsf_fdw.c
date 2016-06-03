@@ -126,10 +126,11 @@ typedef struct ColumnMapping {
 /* Restrictions that are internalized to the FDW */
 typedef enum {
   RestrictInt,
+  RestrictInt64,
   RestrictDouble,
   RestrictEnum,
   RestrictBool,
-  RestrictSring
+  RestrictString
 } RestrictionType;
 
 typedef struct RestrictionBase {
@@ -144,6 +145,13 @@ typedef struct IntRestriction {
   int upperBound;
   bool includeBounds;  // Operation is >= and <=, not > and <
 } IntRestriction;
+
+typedef struct Int64Restriction {
+  RestrictionBase base;
+  int64_t lowerBound;
+  int64_t upperBound;
+  bool includeBounds;  // Operation is >= and <=, not > and <
+} Int64Restriction;
 
 typedef struct DoubleRestriction {
   RestrictionBase base;
@@ -192,7 +200,7 @@ typedef struct TsfFdwExecState {
   struct ColumnMapping *columnMapping;
 
   int restrictionCount;
-  struct RestrictionBase *columnRestrictions;
+  struct RestrictionBase **columnRestrictions;
 
   tsf_field_type fieldType;
 
@@ -1055,6 +1063,63 @@ static void TsfExplainForeignScan(ForeignScanState *scanState, ExplainState *exp
   }
 }
 
+static RestrictionBase* buildRestriction(ColumnMapping *col, tsf_field* field)
+{
+  switch(field->value_type) {
+    case TypeEnum:
+    case TypeEnumArray:
+    {
+      EnumRestriction* r = palloc0(sizeof(EnumRestriction));
+      r->base.col = col;
+      r->base.type = RestrictEnum;
+      r->include = palloc0(sizeof(int) * field->enum_count); //max size
+      return (RestrictionBase*)r;
+    }
+    default:
+    {
+      ereport(
+        WARNING,
+        (errmsg("internalized condition for type not suppored"),
+         errdetail("Field %s with value type %d", field->name, field->value_type)));
+    }
+  }
+  return NULL;
+}
+
+static void buildColumnRestrictions(TsfFdwExecState *state) {
+  state->columnRestrictions =
+      palloc0(sizeof(RestrictionBase *) * list_length(state->qualList));
+
+  ListCell *lc;
+  foreach (lc, state->qualList) {
+    MulticornBaseQual *qual = lfirst(lc);
+    uint32 qualColumnIndex = qual->varattno - 1;
+
+    // Find columnMapping for qual->varattno
+    ColumnMapping *col = NULL;
+    for (int i = 0; i < state->columnCount; i++) {
+      if (state->columnMapping[i].columnIndex == qualColumnIndex) {
+        col = &state->columnMapping[i];
+        break;
+      }
+    }
+    if (!col) // Won't find _id and _entity_id here
+      continue;
+
+    // Construct
+    Assert(col->sourceIdx >= 0 && col->sourceIdx < state->sourceCount);
+    TsfSourceState *sourceState = &state->sources[col->sourceIdx];
+    tsf_source *tsfSource =
+        &sourceState->tsf->sources[sourceState->sourceId - 1];
+
+    tsf_field *field = &tsfSource->fields[col->fieldIdx];
+    RestrictionBase *restriction = buildRestriction(col, field);
+    // Add to to state
+    state->columnRestrictions[state->restrictionCount++] = restriction;
+    elog(INFO, "added restriction [%d] %p", state->restrictionCount, restriction);
+  }
+}
+
 /*
  * TsfBeginForeignScan opens the TSF file. Does not validate the query
  * yet, that happens of the first iteration.
@@ -1111,6 +1176,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags)
                         ((Expr *)lfirst(lc)),
                         &executionState->qualList);
   }
+  buildColumnRestrictions(executionState);
 
   // elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId,
   // tsfFdwOptions->fieldType, list_length(columnList), list_length(foreignExprs));
@@ -1287,8 +1353,8 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
 static void TsfReScanForeignScan(ForeignScanState *scanState)
 {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
-  // elog(INFO, "entering function %s[%d][%d] isChanged: %d, %p %p", __func__, state->sourceId,
-  // (bool)scanState->ss.ps.chgParam , state->fieldType, state, state->iter);
+  elog(INFO, "entering function %s isChanged: %d, %d %p %p", __func__,
+       (bool)scanState->ss.ps.chgParam , state->fieldType, state, state->iter);
   if (state->iter) {
     /*
      * If any internal parameters affecting this node have changed, we
@@ -1600,6 +1666,26 @@ static bool isEntityIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
+
+  switch(get_atttype(foreignTableId, qual->varattno)) {
+    case TEXTOID: {
+      // ex. effectcombined = ANY ('{LoF,Missense}'::text[])
+      if(strcmp(qual->opname, "=") == 0 && qual->isArray && qual->useOr && qual->typeoid == TEXTARRAYOID)
+        return true;
+      break;
+    }
+    case TEXTARRAYOID: {
+      // ex. effect && '{LoF,Missense}'::text[]
+      if(strcmp(qual->opname, "&&") == 0 && !qual->isArray && !qual->useOr && qual->typeoid == TEXTARRAYOID)
+        return true;
+      break;
+    }
+  }
+
+  // Look up the type for this field.
+
+  elog(INFO, "%s[%d] %s isArray[%d] useOr[%d] typeoid[%d]", columnName, get_atttype(foreignTableId, qual->varattno), qual->opname, qual->isArray, qual->useOr, qual->typeoid == TEXTARRAYOID);
+
   // TODO: check if clause is a expression that TSF can handle internally.
   // For example:
   // tsf_variable <supported_operator> sub_expression
@@ -1668,10 +1754,71 @@ static void parseQualIntoIdList(int **idList, int *idListCount, bool isNull, boo
   }
 }
 
+static int findEnumIdx(tsf_field* field, const char* str)
+{
+  for(int i= 0; i<field->enum_count; i++) {
+    if(strcmp(field->enum_names[i], str) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field, MulticornBaseQual* qual, Datum value, bool isNull)
+{
+  switch(field->value_type) {
+    case TypeEnum:
+    case TypeEnumArray:
+    {
+      EnumRestriction* r = (EnumRestriction*)restriction;
+      r->base.includeMissing = false;
+      r->includeCount = 0;
+      if(isNull) {
+        r->base.includeMissing = true;
+        return;
+      }
+      if(qual->typeoid == TEXTOID) {
+        const char* str = TextDatumGetCString(value);
+        int enumIdx = findEnumIdx(field, str);
+        if(enumIdx >= 0) {
+          r->include[r->includeCount++] = enumIdx;
+        }
+      }
+      else if(qual->typeoid == TEXTARRAYOID) {
+        ArrayType* strArray = DatumGetArrayTypeP(value);
+        ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
+
+        Datum itrValue;
+        bool itrIsNull;
+        while(array_iterate(iterator, &itrValue, &itrIsNull)) {
+          if(itrIsNull) {
+            r->base.includeMissing = true;
+            continue;
+          }
+          char *str = TextDatumGetCString(itrValue);
+          int enumIdx = findEnumIdx(field, str);
+          if(enumIdx >= 0) {
+            r->include[r->includeCount++] = enumIdx;
+          }
+        }
+      }
+      return;
+    }
+    default:
+    {
+      ereport(
+        WARNING,
+        (errmsg("internalized condition for type not suppored"),
+         errdetail("Field %s with value type %d", field->name, field->value_type)));
+    }
+  }
+}
+
 static void executeQualList(ForeignScanState *scanState, bool dontUpdateConst, bool *entityIdsChanged)
 {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
   ListCell *lc;
+  int rIdx = 0;
 
   ExprContext *econtext = scanState->ss.ps.ps_ExprContext;
 
@@ -1698,21 +1845,33 @@ static void executeQualList(ForeignScanState *scanState, bool dontUpdateConst, b
       default:
         break;
     }
-    if (usable) {
-      // Process const qual into TSF based query state manager.
-      // Special case for _id and _entity_id
-      if (state->idColumnIndex >= 0 && qual->varattno - 1 == state->idColumnIndex) {
-        // _id qual
-        state->idListIdx = -1;
-        parseQualIntoIdList(&state->idList, &state->idListCount, isNull, qual->isArray, value);
-      }
-      if (state->entityIdColumnIndex >= 0 && qual->varattno - 1 == state->entityIdColumnIndex) {
-        // _entity_id qual
-        parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, isNull, qual->isArray,
-                            value);
-        if (entityIdsChanged)
-          *entityIdsChanged = true;
-      }
+    if (!usable) {
+      continue; // TODO: warn?
+    }
+    // Process const qual into TSF based query state manager.
+    // Special case for _id and _entity_id
+    uint32 qualColumnIndex = qual->varattno - 1;
+    if (state->idColumnIndex >= 0 && qualColumnIndex == state->idColumnIndex) {
+      // _id qual
+      state->idListIdx = -1;
+      parseQualIntoIdList(&state->idList, &state->idListCount, isNull,
+                          qual->isArray, value);
+    } else if (state->entityIdColumnIndex >= 0 &&
+               qualColumnIndex == state->entityIdColumnIndex) {
+      // _entity_id qual
+      parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount,
+                          isNull, qual->isArray, value);
+      if (entityIdsChanged)
+        *entityIdsChanged = true;
+    } else {
+      RestrictionBase *restriction = state->columnRestrictions[rIdx++];
+
+      ColumnMapping *col = restriction->col;
+      TsfSourceState *sourceState = &state->sources[col->sourceIdx];
+      tsf_source *tsfSource =
+          &sourceState->tsf->sources[sourceState->sourceId - 1];
+      tsf_field *field = &tsfSource->fields[col->fieldIdx];
+      bindRestrictionValue(restriction, field, qual, value, isNull);
     }
   }
 }
@@ -1778,29 +1937,317 @@ static void resetQuery(TsfFdwExecState *state)
   state->iter = NULL;
 }
 
-static bool iterateWithRestrictions(TsfFdwExecState *state)
-{
+static bool evalRestrictionUnit(tsf_v value, bool is_null,
+                                RestrictionBase *restriction) {
+  if (is_null) // iterator pulls this out, use it to filter here
+    return restriction->includeMissing;
+
+  ColumnMapping *col = restriction->col;
+  tsf_field *f = col->iter->fields[0];
+  switch (f->value_type) {
+    case TypeInt32: {
+      Assert(restriction->type == RestrictInt);
+      IntRestriction *r = (IntRestriction *)restriction;
+      int v = v_int32(value);
+      if (v < r->lowerBound || v > r->upperBound)
+        return false;
+      break;
+    }
+    case TypeInt64: {
+      Assert(restriction->type == RestrictInt64);
+      Int64Restriction *r = (Int64Restriction *)restriction;
+      int64_t v = v_int64(value);
+      if (v < r->lowerBound || v > r->upperBound)
+        return false;
+      break;
+    }
+    case TypeFloat32: {
+      Assert(restriction->type == RestrictDouble);
+      DoubleRestriction *r = (DoubleRestriction *)restriction;
+      float v = v_float32(value);
+      if ((double)v < r->lowerBound || (double)v > r->upperBound)
+        return false;
+      break;
+    }
+    case TypeFloat64: {
+      Assert(restriction->type == RestrictDouble);
+      DoubleRestriction *r = (DoubleRestriction *)restriction;
+      double v = v_float64(value);
+      if (v < r->lowerBound || v > r->upperBound)
+        return false;
+      break;
+    }
+    case TypeBool: {
+      Assert(restriction->type == RestrictBool);
+      BoolRestriction *r = (BoolRestriction *)restriction;
+      char v = v_bool(value);
+      if ((v && !r->includeTrue) || (!v && !r->includeFalse))
+        return false;
+      break;
+    }
+    case TypeString: {
+      Assert(restriction->type == RestrictString);
+      StringRestriction *r = (StringRestriction *)restriction;
+      const char *s = v_str(value);
+      if (strcmp(s, r->match) != 0)
+        return false;
+      break;
+    }
+    case TypeEnum: {
+      Assert(restriction->type == RestrictionEnum);
+
+      EnumRestriction *r = (EnumRestriction *)restriction;
+      int idx = v_int32(value);
+      bool matchOne = false;
+      // r->include is list of acceptible indexes
+      for (int j = 0; j < r->includeCount; j++) {
+        if (idx == r->include[j]) {
+          matchOne = true;
+          break;
+        }
+      }
+      if (!matchOne)
+        return false;
+      break;
+    }
+    default: {
+      ereport(ERROR,
+              (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+               errmsg("unexpected tsf unit type when evaluating restriction"),
+               errhint("Tsf field %s with type %d", f->name, f->value_type)));
+    }
+  }
+  return true;
+}
+
+static bool evalRestrictionArray(tsf_v value, bool is_null,
+                                 RestrictionBase *restriction) {
+  if (is_null)
+    return restriction->includeMissing;
+
+  // All array operators are OR logic, so all values must fail
+  ColumnMapping *col = restriction->col;
+  tsf_field *f = col->iter->fields[0];
+  int size = va_size(value);
+  switch (f->value_type) {
+    case TypeInt32Array: {
+      Assert(restriction->type == RestrictInt);
+
+      IntRestriction *r = (IntRestriction *)restriction;
+      for (int i = 0; i < size; i++) {
+        int v = va_int32(value, i);
+        if (v != INT_MISSING) {
+          if (v >= r->lowerBound && v <= r->upperBound)
+            return true;
+        } else {
+          if (restriction->includeMissing)
+            return true;
+        }
+      }
+      return false;
+    }
+    case TypeFloat32Array: {
+      Assert(restriction->type == RestrictDouble);
+
+      DoubleRestriction *r = (DoubleRestriction *)restriction;
+      for (int i = 0; i < size; i++) {
+        float v = va_float32(value, i);
+        if (v != FLOAT_MISSING) {
+          if ((double)v >= r->lowerBound && (double)v <= r->upperBound)
+            return true;
+        } else {
+          if (restriction->includeMissing)
+            return true;
+        }
+      }
+      return false;
+    }
+    case TypeFloat64Array: {
+      Assert(restriction->type == RestrictDouble);
+
+      DoubleRestriction *r = (DoubleRestriction *)restriction;
+      for (int i = 0; i < size; i++) {
+        double v = va_float64(value, i);
+        if (v != DOUBLE_MISSING) {
+          if (v >= r->lowerBound && v <= r->upperBound)
+            return true;
+        } else {
+          if (restriction->includeMissing)
+            return true;
+        }
+      }
+      return false;
+    }
+    case TypeBoolArray: {
+      Assert(restriction->type == RestrictBool);
+
+      BoolRestriction *r = (BoolRestriction *)restriction;
+      for (int i = 0; i < size; i++) {
+        char v = va_bool(value, i);
+        if (v != BOOL_MISSING) {
+          if ((v && r->includeTrue) || (!v && r->includeFalse))
+            return true;
+        } else {
+          if (restriction->includeMissing)
+            return true;
+        }
+      }
+      return false;
+    }
+    case TypeStringArray: {
+      Assert(restriction->type == RestrictString);
+
+      StringRestriction *r = (StringRestriction *)restriction;
+      const char *s = va_array(value);
+      for (int i = 0; i < size; i++) {
+        bool isnull = s[0] == '\0' || (s[0] == '?' && s[1] == '\0');
+        if (!isnull) {
+          if (strcmp(s, r->match) == 0)
+            return true;
+        } else {
+          if (restriction->includeMissing)
+            return true;
+        }
+        // Advanced past next NULL
+        while (s[0] != '\0') // increment to next NULL
+          s++;
+        s++; // go past the NULL
+      }
+      return false;
+    }
+    case TypeEnumArray: {
+      Assert(restriction->type == RestrictionEnum);
+
+      EnumRestriction *r = (EnumRestriction *)restriction;
+      for (int i = 0; i < size; i++) {
+        int idx = va_int32(value, i);
+        if (idx != INT_MISSING) {
+          bool matchOne = false;
+          // r->include is list of acceptible indexes
+          for (int j = 0; j < r->includeCount; j++) {
+            if (idx == r->include[j]) {
+              matchOne = true;
+              break;
+            }
+          }
+          if (matchOne)
+            return true;
+        } else {
+          // Missing enum value
+          if (restriction->includeMissing)
+            return true;
+        }
+      }
+      return false;
+    }
+    default: {
+      ereport(ERROR,
+              (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+               errmsg("unexpected tsf array type when evaluating restriction"),
+               errhint("Tsf field %s with type %d", f->name, f->value_type)));
+    }
+  }
+  return true;
+}
+
+static bool iterateWithRestrictions(TsfFdwExecState *state) {
   // Advanced our master iterator along until all of our restricitons are satisifed or it reaches
   // the end. Returns false when at end-of-table.
   while (tsf_iter_next(state->iter)) {
     bool allRestrictionsSatisifed = true;
-    for (int i = 0; i < state->restrictionCount; i++) {
-      // TODO: Build out this pseudocode
-      // if mapping
-      //  read state->restricitons[i]->col->mappingIter
-      //  someEvaled = false
-      //  for each in mapping:
-      //   read value
-      //   if eval conditional (all mapping is ANY(restriction) semantics)
-      //     someEvaled = true
-      //     break
-      //  if not someEvalued:
-      //    allRestrictionsSatisifed = false;
-      //    break;
-      // read state->restricitons[i]->col->iter
-      //  if not eval conditional
-      //    allRestrictionsSatisifed = false;
-      //    break;
+    for (int restIdx = 0; restIdx < state->restrictionCount; restIdx++) {
+      RestrictionBase* restriction = state->columnRestrictions[restIdx];
+      ColumnMapping *col = restriction->col;
+      tsf_field *f = col->iter->fields[0];
+      bool colIsArray = tsf_value_type_is_array(f->value_type);
+      // elog(INFO, "restriction [%d] type %d %s %d %d", restIdx, restriction->type, f->name, colIsArray, (bool)col->mappingIter);
+
+      if (col->mappingIter) {
+        // Evaluate mapped fields on each element directly as we only
+        // support OR logic on element aggregation.
+
+        // Sync mapping iter
+        syncIter(col->mappingIter, state->iter);
+        tsf_field *mf = col->mappingIter->fields[0];
+        if (mf->value_type == TypeInt32Array) {
+
+          // Mapping is 1:M
+          int size = va_size(col->mappingIter->cur_values[0]);
+
+          // If NULL mapping, rely on includeMissing
+          if (size == 0) {
+            if (restriction->includeMissing) {
+              continue; // satisfies restriction
+            } else {
+              allRestrictionsSatisifed = false;
+              break; // short circut restriction checks
+            }
+          }
+
+          // Eval each element mapped to
+          bool match = false;
+          for (int i = 0; i < size; i++) {
+            // Read the ID at 'i' in the mapping field
+            if (col->iter->is_matrix_iter)
+              tsf_iter_id_matrix(col->iter,
+                                 va_int32(col->mappingIter->cur_values[0], i),
+                                 state->iter->cur_entity_idx);
+            else
+              tsf_iter_id(col->iter,
+                          va_int32(col->mappingIter->cur_values[0], i));
+            tsf_v value = col->iter->cur_values[0];
+            bool is_null = col->iter->cur_nulls[0];
+
+            if (colIsArray) {
+              if (evalRestrictionArray(value, is_null, restriction)) {
+                match = true;
+                break; // short circut restriction checks
+              }
+            } else {
+              if (evalRestrictionUnit(value, is_null, restriction)) {
+                match = true;
+                break; // short circut restriction checks
+              }
+            }
+          }
+          // If we didn't find one match, fail
+          if (!match) {
+            allRestrictionsSatisifed = false;
+            break;
+          }
+          continue; // Done with 1:M mapping restriction eval
+        } else {
+
+          // Mapping is 1:1
+          Assert(mf->value_type == TypeInt32);
+          int id = v_int32(col->mappingIter->cur_values[0]);
+          if (col->iter->is_matrix_iter)
+            tsf_iter_id_matrix(col->iter, id, state->iter->cur_entity_idx);
+          else
+            tsf_iter_id(col->iter, id);
+          // Note: explicit fall-through to code below that assumes col->iter is
+          // placed
+        }
+      } else {
+        // For non-mapped, we need to read by ID for each field
+        syncIter(col->iter, state->iter);
+      }
+
+      // iter has been updated by a mapping field or being driven directly
+      tsf_v value = col->iter->cur_values[0];
+      bool is_null = col->iter->cur_nulls[0];
+
+      if (colIsArray) {
+        if (!evalRestrictionArray(value, is_null, restriction)) {
+          allRestrictionsSatisifed = false;
+          break; // short circut restriction checks
+        }
+      } else {
+        if (!evalRestrictionUnit(value, is_null, restriction)) {
+          allRestrictionsSatisifed = false;
+          break; // short circut restriction checks
+        }
+      }
     }
     if (allRestrictionsSatisifed)
       return true;
@@ -2058,9 +2505,7 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
         Datum *elements = palloc0(size * sizeof(Datum));
         int *sizes = palloc0(size * sizeof(int));
         int maxSubElementSize = 0;
-        bool colIsArray = f->value_type == TypeInt32Array || f->value_type == TypeFloat32Array ||
-                          f->value_type == TypeFloat64Array || f->value_type == TypeBoolArray ||
-                          f->value_type == TypeStringArray || f->value_type == TypeEnumArray;
+        bool colIsArray = tsf_value_type_is_array(f->value_type);
 
         // If colIsArray, then we build a two-dimentional postgres
         // array. This requires the second dimention to be a fixed size,

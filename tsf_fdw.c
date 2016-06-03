@@ -201,6 +201,7 @@ typedef struct TsfFdwExecState {
 
   // Parsed out of qualList is restriciton info
   List *qualList;
+  bool paramsChanged; //re-eval on next iter
 
   // iter to be driven by a specific set of IDs
   int idListIdx;
@@ -1138,6 +1139,23 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState)
    */
   ExecClearTuple(tupleSlot);
 
+  if (state->paramsChanged) {
+      bool updatedEntityIds = false;
+      executeQualList(scanState, true, &updatedEntityIds);
+      state->iter->cur_entity_idx = -1;  // Reset inner entity counter
+      if (updatedEntityIds) {
+        // Reset iter and let it be re-opened in TsfIterateForeignScan
+        // with the updated entityIds as input params.
+        //
+        // TODO: Possibly save the iter by having a TSF function to
+        // update entity IDs for existing iterator
+        //
+        //elog(INFO, "reset entity id list");
+        resetQuery(state);
+      }
+      state->paramsChanged = false;
+  }
+
   if (!state->iter) {
     //EState *estate = scanState->ss.ps.state;
     //MemoryContextStats(estate->es_query_cxt);
@@ -1237,26 +1255,10 @@ static void TsfReScanForeignScan(ForeignScanState *scanState)
      * just re-evalue and update iterator instead of destorying it.
      */
     if (scanState->ss.ps.chgParam != NULL) {
-      bool updatedEntityIds = false;
-      executeQualList(scanState, true, &updatedEntityIds);
-      state->iter->cur_entity_idx = -1;  // Reset inner entity counter
-      if (updatedEntityIds) {
-        // Reset iter and let it be re-opened in TsfIterateForeignScan
-        // with the updated entityIds as input params.
-        //
-        // TODO: Possibly save the iter by having a TSF function to
-        // update entity IDs for existing iterator
-        //
-        //elog(INFO, "reset entity id list");
-        resetQuery(state);
-        tsf_iter_close(state->iter);
-        state->iter = NULL;
-      }
+      state->paramsChanged = true;
     } else {
       // Close and clear iterator, TsfIterateForeignScan will rebuild
       resetQuery(state);
-      tsf_iter_close(state->iter);
-      state->iter = NULL;
     }
   }
 }

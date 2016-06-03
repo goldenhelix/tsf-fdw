@@ -246,7 +246,7 @@ static bool isParamatizable(Oid foreignTableId, RelOptInfo *baserel, Expr *expr,
                             bool *outIsEntityIdRestriction);
 
 /* Scan iteration helpers */
-static void executeQualList(ForeignScanState *scanState, bool *updatedEntityIds);
+static void executeQualList(ForeignScanState *scanState, bool dontUpdateConst, bool *entityIdsChanged);
 static void initQuery(TsfFdwExecState *state);
 static void resetQuery(TsfFdwExecState *state);
 static bool iterateWithRestrictions(TsfFdwExecState *state);
@@ -1139,24 +1139,28 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState)
   ExecClearTuple(tupleSlot);
 
   if (!state->iter) {
+    //EState *estate = scanState->ss.ps.state;
+    //MemoryContextStats(estate->es_query_cxt);
+
     // Should only need to be done once, as we fill we clear cells
     memset(columnValues, 0, columnCount * sizeof(Datum));
     memset(columnNulls, true, columnCount * sizeof(bool));
 
     // Evalue expressions we extracted in qualList. This updates
     // state->entityIdList and state->idList.
-    executeQualList(scanState, 0);
+    executeQualList(scanState, false, 0);
 
     // Initiate our iterators (one for each column and the master state->iter)
     initQuery(state);
   }
 
   if (state->idList) {
-    // elog(INFO, "[%d][%d] id scan: %d", state->sourceId, state->fieldType, state->idListIdx);
     // Special iteration if we are doing ID lookups
     if (state->iter->cur_entity_idx >= 0 &&
         state->iter->cur_entity_idx + 1 < state->iter->entity_count) {
       // If there are more entities to scan for the current ID, use iter_next to scan those
+      //elog(NOTICE, "next _id: %d _entity_id: %d", state->idList[state->idListIdx], state->iter->cur_entity_idx);
+
       if (tsf_iter_next(state->iter)) {
         fillTupleSlot(state, columnValues, columnNulls);
         ExecStoreVirtualTuple(tupleSlot);
@@ -1211,6 +1215,9 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
     }
     free(state->idList);
     free(state->entityIdList);
+
+    //EState *estate = scanState->ss.ps.state;
+    //MemoryContextStats(estate->es_query_cxt);
   }
 }
 
@@ -1231,12 +1238,16 @@ static void TsfReScanForeignScan(ForeignScanState *scanState)
      */
     if (scanState->ss.ps.chgParam != NULL) {
       bool updatedEntityIds = false;
-      executeQualList(scanState, &updatedEntityIds);
+      executeQualList(scanState, true, &updatedEntityIds);
       state->iter->cur_entity_idx = -1;  // Reset inner entity counter
       if (updatedEntityIds) {
         // Reset iter and let it be re-opened in TsfIterateForeignScan
         // with the updated entityIds as input params.
-        // elog(INFO, "reset entity id list");
+        //
+        // TODO: Possibly save the iter by having a TSF function to
+        // update entity IDs for existing iterator
+        //
+        //elog(INFO, "reset entity id list");
         resetQuery(state);
         tsf_iter_close(state->iter);
         state->iter = NULL;
@@ -1615,7 +1626,7 @@ static void parseQualIntoIdList(int **idList, int *idListCount, bool isNull, boo
   }
 }
 
-static void executeQualList(ForeignScanState *scanState, bool *updatedEntityIds)
+static void executeQualList(ForeignScanState *scanState, bool dontUpdateConst, bool *entityIdsChanged)
 {
   TsfFdwExecState *state = (TsfFdwExecState *)scanState->fdw_state;
   ListCell *lc;
@@ -1636,6 +1647,8 @@ static void executeQualList(ForeignScanState *scanState, bool *updatedEntityIds)
         value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
         break;
       case T_Const:
+        if(dontUpdateConst)
+          continue;
         usable = true;
         value = ((MulticornConstQual *)qual)->value;
         isNull = ((MulticornConstQual *)qual)->isnull;
@@ -1655,8 +1668,8 @@ static void executeQualList(ForeignScanState *scanState, bool *updatedEntityIds)
         // _entity_id qual
         parseQualIntoIdList(&state->entityIdList, &state->entityIdListCount, isNull, qual->isArray,
                             value);
-        if (updatedEntityIds)
-          *updatedEntityIds = true;
+        if (entityIdsChanged)
+          *entityIdsChanged = true;
       }
     }
   }

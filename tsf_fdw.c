@@ -73,6 +73,8 @@
 #error "Only 64-bit machines supported. USE_FLOAT8_BYVAL must be set"
 #endif
 
+//#define REPORT_ITER_STATS 1
+
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
 
@@ -1226,9 +1228,47 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
 
     for (int i = 0; i < state->columnCount; i++) {
       ColumnMapping *col = &state->columnMapping[i];
+#ifdef REPORT_ITER_STATS
+      if (col->iter) {
+        ereport(
+            WARNING,
+            (errmsg("col[%d] iter (%de) stats: Read %d chunks (%lld/%lld "
+                    "decompressed) in %dms + %dms to decompress. %d/%d "
+                    "records in cur chunk (%.2f%%).",
+                    col->columnIndex,
+                    col->iter->entity_count < 0 ? 0 :col->iter->entity_count,
+                    col->iter->stats.read_chunks,
+                    col->iter->stats.read_chunk_bytes,
+                    col->iter->stats.decompressed_bytes,
+                    ((int)col->iter->stats.read_time/1000),
+                    ((int)col->iter->stats.decompress_time/1000),
+                    col->iter->stats.records_in_mem,
+                    col->iter->stats.records_total,
+                    ((float)col->iter->stats.records_in_mem /
+                     col->iter->stats.records_total)*100)));
+      }
+#endif
       tsf_iter_close(col->iter);
     }
     for (int i = 0; i < state->sourceCount; i++) {
+      tsf_iter* iter = state->sources[i].mappingIter;
+#ifdef REPORT_ITER_STATS
+      if (iter) {
+        ereport(
+            WARNING,
+            (errmsg("source[%d] mapping iter stats: Read %d chunks (%lld"
+                    "/%lld decompressed) in %dms + %dms to decompress. %d/%d "
+                    "records in cur chunk (%.2f%%).",
+                    i, iter->stats.read_chunks, iter->stats.read_chunk_bytes,
+                    iter->stats.decompressed_bytes,
+                    ((int)iter->stats.read_time / 1000),
+                    ((int)iter->stats.decompress_time / 1000),
+                    iter->stats.records_in_mem, iter->stats.records_total,
+                    ((float)iter->stats.records_in_mem /
+                     iter->stats.records_total) *
+                        100)));
+      }
+#endif
       tsf_iter_close(state->sources[i].mappingIter);
     }
     free(state->idList);

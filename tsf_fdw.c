@@ -1269,7 +1269,7 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
                         100)));
       }
 #endif
-      tsf_iter_close(state->sources[i].mappingIter);
+      tsf_iter_close(iter);
     }
     free(state->idList);
     free(state->entityIdList);
@@ -1810,12 +1810,12 @@ static bool iterateWithRestrictions(TsfFdwExecState *state)
 }
 
 /* Sync iter to ref_iter */
-static void syncIter(tsf_iter *iter, tsf_iter *ref_iter)
+static bool syncIter(tsf_iter *iter, tsf_iter *ref_iter)
 {
   if (iter->is_matrix_iter)
-    tsf_iter_id_matrix(iter, ref_iter->cur_record_id, ref_iter->cur_entity_idx);
+    return tsf_iter_id_matrix(iter, ref_iter->cur_record_id, ref_iter->cur_entity_idx);
   else
-    tsf_iter_id(iter, ref_iter->cur_record_id);
+    return tsf_iter_id(iter, ref_iter->cur_record_id);
 }
 
 // We need a sentinal for a missing value other than NULL, which is a
@@ -2039,7 +2039,11 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
       if (OidIsValid(columnArrayTypeId))
         get_typlenbyvalalign(columnArrayTypeId, &typeLength, &typeByValue, &typeAlignment);
 
-      syncIter(col->mappingIter, state->iter);
+      if (!syncIter(col->mappingIter, state->iter)) {
+        ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+                        errmsg("error reading mapping chunk from TSF database"),
+                        errhint("Attempting to read record %d", state->iter->cur_record_id)));
+      }
       tsf_field *mf = col->mappingIter->fields[0];
       if (mf->value_type == TypeInt32Array) {
         Assert(OidIsValid(columnArrayTypeId));  // field type must be array
@@ -2159,7 +2163,11 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
       }
     } else {
       // For non-mapped, we need to read by ID for each field
-      syncIter(col->iter, state->iter);
+      if (!syncIter(col->iter, state->iter)) {
+        ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+                        errmsg("error reading chunk from TSF database"),
+                        errhint("Attempting to read record %d", state->iter->cur_record_id)));
+      }
     }
 
     // iter has been updated by a mapping field or being driven directly

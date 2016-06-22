@@ -1937,6 +1937,15 @@ static void resetQuery(TsfFdwExecState *state)
   state->iter = NULL;
 }
 
+/* Sync iter to ref_iter */
+static bool syncIter(tsf_iter *iter, tsf_iter *ref_iter)
+{
+  if (iter->is_matrix_iter)
+    return tsf_iter_id_matrix(iter, ref_iter->cur_record_id, ref_iter->cur_entity_idx);
+  else
+    return tsf_iter_id(iter, ref_iter->cur_record_id);
+}
+
 static bool evalRestrictionUnit(tsf_v value, bool is_null,
                                 RestrictionBase *restriction) {
   if (is_null) // iterator pulls this out, use it to filter here
@@ -2167,7 +2176,11 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
         // support OR logic on element aggregation.
 
         // Sync mapping iter
-        syncIter(col->mappingIter, state->iter);
+        if (!syncIter(col->mappingIter, state->iter)) {
+          ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+                          errmsg("error reading mapping chunk from TSF database"),
+                          errhint("Attempting to read record %d", state->iter->cur_record_id)));
+        }
         tsf_field *mf = col->mappingIter->fields[0];
         if (mf->value_type == TypeInt32Array) {
 
@@ -2230,7 +2243,12 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
         }
       } else {
         // For non-mapped, we need to read by ID for each field
-        syncIter(col->iter, state->iter);
+        if (!syncIter(col->iter, state->iter)) {
+          ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+                          errmsg("error reading chunk from TSF database"),
+                          errhint("Attempting to read record %d",
+                                  state->iter->cur_record_id)));
+        }
       }
 
       // iter has been updated by a mapping field or being driven directly
@@ -2254,15 +2272,6 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
     // Otherwise loop and eval next record
   }
   return false;  // End of table
-}
-
-/* Sync iter to ref_iter */
-static bool syncIter(tsf_iter *iter, tsf_iter *ref_iter)
-{
-  if (iter->is_matrix_iter)
-    return tsf_iter_id_matrix(iter, ref_iter->cur_record_id, ref_iter->cur_entity_idx);
-  else
-    return tsf_iter_id(iter, ref_iter->cur_record_id);
 }
 
 // We need a sentinal for a missing value other than NULL, which is a

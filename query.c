@@ -256,13 +256,13 @@ void extractRestrictions(Relids base_relids, Expr *node, List **quals)
       // We want to be able to handle top-level OR splits. Or minimally our common use case of adding "OR <field> IS NULL".
       // Example nodeToString of case we don't handle but should:
       // {BOOLEXPR :boolop or :args ({NULLTEST :arg {VAR :varno 1 :varattno 6 :vartype 1009 :vartypmod -1 :varcollid 100 :varlevelsup 0 :varnoold 1 :varoattno 6 :location 48} :nulltesttype 0 :argisrow false :location 68} {OPEXPR :opno 2751 :opfuncid 2748 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 100 :args ({VAR :varno 1 :varattno 6 :vartype 1009 :vartypmod -1 :varcollid 100 :varlevelsup 0 :varnoold 1 :varoattno 6 :location 79} {CONST :consttype 1009 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 32 [ -128 0 0 0 1 0 0 0 0 0 0 0 25 0 0 0 1 0 0 0 1 0 0 0 32 0 0 0 114 115 49 50 ]}) :location 99}) :location -1}
-      /*
+      
       ereport(WARNING,
               (errmsg(
                    "unsupported expression for "
                    "extractClauseFrom"),
                errdetail("%s", nodeToString(node))));
-      */
+      
     } break;
   }
 }

@@ -1684,7 +1684,7 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 
   // Look up the type for this field.
 
-  elog(INFO, "%s[%d] %s isArray[%d] useOr[%d] typeoid[%d]", columnName, get_atttype(foreignTableId, qual->varattno), qual->opname, qual->isArray, qual->useOr, qual->typeoid == TEXTARRAYOID);
+  elog(INFO, "%s[%d] %s isArray[%d] useOr[%d] typeoid[%d]", columnName, get_atttype(foreignTableId, qual->varattno), qual->opname, qual->isArray, qual->useOr, qual->typeoid);
 
   // TODO: check if clause is a expression that TSF can handle internally.
   // For example:
@@ -1958,32 +1958,52 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       Assert(restriction->type == RestrictInt);
       IntRestriction *r = (IntRestriction *)restriction;
       int v = v_int32(value);
-      if (v < r->lowerBound || v > r->upperBound)
-        return false;
+      if (r->includeBounds) {
+        if (v < r->lowerBound || v > r->upperBound)
+          return false;
+      } else {
+        if (v <= r->lowerBound || v >= r->upperBound)
+          return false;
+      }
       break;
     }
     case TypeInt64: {
       Assert(restriction->type == RestrictInt64);
       Int64Restriction *r = (Int64Restriction *)restriction;
       int64_t v = v_int64(value);
-      if (v < r->lowerBound || v > r->upperBound)
-        return false;
+      if (r->includeBounds) {
+        if (v < r->lowerBound || v > r->upperBound)
+          return false;
+      } else {
+        if (v <= r->lowerBound || v >= r->upperBound)
+          return false;
+      }
       break;
     }
     case TypeFloat32: {
       Assert(restriction->type == RestrictDouble);
       DoubleRestriction *r = (DoubleRestriction *)restriction;
-      float v = v_float32(value);
-      if ((double)v < r->lowerBound || (double)v > r->upperBound)
-        return false;
+      double v = (double)v_float32(value);
+      if (r->includeBounds) {
+        if (v < r->lowerBound || v > r->upperBound)
+          return false;
+      } else {
+        if (v <= r->lowerBound || v >= r->upperBound)
+          return false;
+      }
       break;
     }
     case TypeFloat64: {
       Assert(restriction->type == RestrictDouble);
       DoubleRestriction *r = (DoubleRestriction *)restriction;
       double v = v_float64(value);
-      if (v < r->lowerBound || v > r->upperBound)
-        return false;
+      if (r->includeBounds) {
+        if (v < r->lowerBound || v > r->upperBound)
+          return false;
+      } else {
+        if (v <= r->lowerBound || v >= r->upperBound)
+          return false;
+      }
       break;
     }
     case TypeBool: {
@@ -1998,7 +2018,8 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       Assert(restriction->type == RestrictString);
       StringRestriction *r = (StringRestriction *)restriction;
       const char *s = v_str(value);
-      if (strcmp(s, r->match) != 0)
+      bool match = strcmp(s, r->match) == 0;
+      if(r->doesNotMatch == match) // this works, think about it...
         return false;
       break;
     }
@@ -2037,7 +2058,11 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
   // All array operators are OR logic, so all values must fail
   ColumnMapping *col = restriction->col;
   tsf_field *f = col->iter->fields[0];
+
   int size = va_size(value);
+  if(size == 0)
+    return restriction->includeMissing;
+
   switch (f->value_type) {
     case TypeInt32Array: {
       Assert(restriction->type == RestrictInt);
@@ -2045,12 +2070,17 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       IntRestriction *r = (IntRestriction *)restriction;
       for (int i = 0; i < size; i++) {
         int v = va_int32(value, i);
-        if (v != INT_MISSING) {
-          if (v >= r->lowerBound && v <= r->upperBound)
-            return true;
-        } else {
+        if (v == INT_MISSING) {
           if (restriction->includeMissing)
             return true;
+        } else {
+          if (r->includeBounds) {
+            if (v >= r->lowerBound && v <= r->upperBound)
+              return true;
+          } else {
+            if (v > r->lowerBound && v < r->upperBound)
+              return true;
+          }
         }
       }
       return false;
@@ -2060,13 +2090,19 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
 
       DoubleRestriction *r = (DoubleRestriction *)restriction;
       for (int i = 0; i < size; i++) {
-        float v = va_float32(value, i);
-        if (v != FLOAT_MISSING) {
-          if ((double)v >= r->lowerBound && (double)v <= r->upperBound)
-            return true;
-        } else {
+        float vf = va_float32(value, i);
+        if (vf == FLOAT_MISSING) {
           if (restriction->includeMissing)
             return true;
+        } else {
+          double v = (double)vf;
+          if (r->includeBounds) {
+            if (v >= r->lowerBound && v <= r->upperBound)
+              return true;
+          } else {
+            if (v > r->lowerBound && v < r->upperBound)
+              return true;
+          }
         }
       }
       return false;
@@ -2077,12 +2113,17 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       DoubleRestriction *r = (DoubleRestriction *)restriction;
       for (int i = 0; i < size; i++) {
         double v = va_float64(value, i);
-        if (v != DOUBLE_MISSING) {
-          if (v >= r->lowerBound && v <= r->upperBound)
-            return true;
-        } else {
+        if (v == DOUBLE_MISSING) {
           if (restriction->includeMissing)
             return true;
+        } else {
+          if (r->includeBounds) {
+            if (v >= r->lowerBound && v <= r->upperBound)
+              return true;
+          } else {
+            if (v > r->lowerBound && v < r->upperBound)
+              return true;
+          }
         }
       }
       return false;
@@ -2093,11 +2134,11 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       BoolRestriction *r = (BoolRestriction *)restriction;
       for (int i = 0; i < size; i++) {
         char v = va_bool(value, i);
-        if (v != BOOL_MISSING) {
-          if ((v && r->includeTrue) || (!v && r->includeFalse))
+        if (v == BOOL_MISSING) {
+          if (restriction->includeMissing)
             return true;
         } else {
-          if (restriction->includeMissing)
+          if ((v && r->includeTrue) || (!v && r->includeFalse))
             return true;
         }
       }
@@ -2110,11 +2151,12 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       const char *s = va_array(value);
       for (int i = 0; i < size; i++) {
         bool isnull = s[0] == '\0' || (s[0] == '?' && s[1] == '\0');
-        if (!isnull) {
-          if (strcmp(s, r->match) == 0)
+        if (isnull) {
+          if (restriction->includeMissing)
             return true;
         } else {
-          if (restriction->includeMissing)
+          bool match = strcmp(s, r->match) == 0;
+          if(r->doesNotMatch != match)
             return true;
         }
         // Advanced past next NULL
@@ -2130,21 +2172,16 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       EnumRestriction *r = (EnumRestriction *)restriction;
       for (int i = 0; i < size; i++) {
         int idx = va_int32(value, i);
-        if (idx != INT_MISSING) {
+        if (idx == INT_MISSING) {
+          if (restriction->includeMissing)
+            return true;
+        } else {
           bool matchOne = false;
           // r->include is list of acceptible indexes
           for (int j = 0; j < r->includeCount; j++) {
-            if (idx == r->include[j]) {
-              matchOne = true;
-              break;
-            }
+            if (idx == r->include[j])
+              return true;
           }
-          if (matchOne)
-            return true;
-        } else {
-          // Missing enum value
-          if (restriction->includeMissing)
-            return true;
         }
       }
       return false;
@@ -2156,7 +2193,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
                errhint("Tsf field %s with type %d", f->name, f->value_type)));
     }
   }
-  return true;
+  return true; //presumed un-reachable
 }
 
 static bool iterateWithRestrictions(TsfFdwExecState *state) {
@@ -2182,10 +2219,11 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
                           errhint("Attempting to read record %d", state->iter->cur_record_id)));
         }
         tsf_field *mf = col->mappingIter->fields[0];
+        tsf_v mapping_v = col->mappingIter->cur_values[0];
         if (mf->value_type == TypeInt32Array) {
 
           // Mapping is 1:M
-          int size = va_size(col->mappingIter->cur_values[0]);
+          int size = va_size(mapping_v);
 
           // If NULL mapping, rely on includeMissing
           if (size == 0) {
@@ -2203,11 +2241,11 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
             // Read the ID at 'i' in the mapping field
             if (col->iter->is_matrix_iter)
               tsf_iter_id_matrix(col->iter,
-                                 va_int32(col->mappingIter->cur_values[0], i),
+                                 va_int32(mapping_v, i),
                                  state->iter->cur_entity_idx);
             else
               tsf_iter_id(col->iter,
-                          va_int32(col->mappingIter->cur_values[0], i));
+                          va_int32(mapping_v, i));
             tsf_v value = col->iter->cur_values[0];
             bool is_null = col->iter->cur_nulls[0];
 
@@ -2230,10 +2268,19 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
           }
           continue; // Done with 1:M mapping restriction eval
         } else {
-
           // Mapping is 1:1
           Assert(mf->value_type == TypeInt32);
-          int id = v_int32(col->mappingIter->cur_values[0]);
+          // TODO: confirm this case sometimes happens
+          if(col->mappingIter->cur_nulls[0]){
+            if (restriction->includeMissing) {
+              continue; // satisfies restriction
+            } else {
+              allRestrictionsSatisifed = false;
+              break; // short circut restriction checks
+            }
+          }
+
+          int id = v_int32(mapping_v);
           if (col->iter->is_matrix_iter)
             tsf_iter_id_matrix(col->iter, id, state->iter->cur_entity_idx);
           else
@@ -2501,9 +2548,10 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
                         errhint("Attempting to read record %d", state->iter->cur_record_id)));
       }
       tsf_field *mf = col->mappingIter->fields[0];
+      tsf_v mapping_v = col->mappingIter->cur_values[0];
       if (mf->value_type == TypeInt32Array) {
         Assert(OidIsValid(columnArrayTypeId));  // field type must be array
-        int size = va_size(col->mappingIter->cur_values[0]);
+        int size = va_size(mapping_v);
         if (size == 0)
           continue;  // Mapped fields also NULL when 0 elements mapped
 
@@ -2522,10 +2570,10 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
         for (int i = 0; i < size; i++) {
           // Read the ID at 'i' in the mapping field
           if (col->iter->is_matrix_iter)
-            tsf_iter_id_matrix(col->iter, va_int32(col->mappingIter->cur_values[0], i),
+            tsf_iter_id_matrix(col->iter, va_int32(mapping_v, i),
                                state->iter->cur_entity_idx);
           else
-            tsf_iter_id(col->iter, va_int32(col->mappingIter->cur_values[0], i));
+            tsf_iter_id(col->iter, va_int32(mapping_v, i));
           tsf_v value = col->iter->cur_values[0];
           bool is_null = col->iter->cur_nulls[0];
 
@@ -2608,7 +2656,9 @@ static void fillTupleSlot(TsfFdwExecState *state, Datum *columnValues, bool *col
         continue;  // Done with 1:M mapping loading of columnValues
       } else {
         Assert(mf->value_type == TypeInt32);
-        int id = v_int32(col->mappingIter->cur_values[0]);
+        if(col->mappingIter->cur_nulls[0])
+          continue;
+        int id = v_int32(mapping_v);
         if (col->iter->is_matrix_iter)
           tsf_iter_id_matrix(col->iter, id, state->iter->cur_entity_idx);
         else

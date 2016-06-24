@@ -64,6 +64,7 @@ typedef struct MulticornBaseQual {
   char *opname;
   bool isArray;
   bool useOr; // ANY on array operators
+  //TODO: Add includeMissing, which integrates "OR field IS NULL"
 } MulticornBaseQual;
 
 typedef struct MulticornConstQual {

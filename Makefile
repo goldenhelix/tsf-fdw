@@ -65,7 +65,7 @@ TSF_OBJS = $(TSF_PATH)/tsf.o \
 #> OPTIMIZATION='-g -O0' make
 OPTIMIZATION?=-O3
 
-PG_CPPFLAGS = --std=c99 -Wno-declaration-after-statement $(OPTIMIZATION) -I$(TSF_PATH) -I$(JANSSON_PATH) -I$(BLOSC_PATH) -I$(ZSTD_PATH) -I$(LZ4_PATH)
+PG_CPPFLAGS = --std=c99 -Wno-declaration-after-statement $(OPTIMIZATION) -I$(TSF_PATH) -I$(JANSSON_PATH) -I$(BLOSC_PATH) -I$(ZSTD_PATH) -I$(ZSTD_PATH)/common -I$(LZ4_PATH)
 SHLIB_LINK = -lz
 OBJS = tsf_fdw.o query.o util.o stringbuilder.o $(TSF_OBJS)
 

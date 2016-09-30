@@ -178,6 +178,7 @@ typedef struct StringRestriction {
   bool doesNotMatch;
 } StringRestriction;
 
+
 typedef struct TsfSourceState {
   int sourceId;
   const char *fileName;
@@ -973,6 +974,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
    * Separate the scan_clauses into those that can be executed
    * internally and those that can't.
    */
+  elog(WARNING,"Test logging");
   ListCell *lc = NULL;
   bool foundIdRestriction = false;
   foreach (lc, scanClauses) {
@@ -987,6 +989,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
     List *quals = NIL;
     extractRestrictions(baserel->relids, rinfo->clause, &quals);
 
+    elog(WARNING, "quals %d", list_length(quals));
     if (list_length(quals) == 1) {
       MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
       // ID restrictions must be only internalized expressions if they
@@ -1063,25 +1066,68 @@ static void TsfExplainForeignScan(ForeignScanState *scanState, ExplainState *exp
   }
 }
 
-static RestrictionBase* buildRestriction(ColumnMapping *col, tsf_field* field)
+static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
 {
-  switch(field->value_type) {
-    case TypeEnum:
-    case TypeEnumArray:
-    {
-      EnumRestriction* r = palloc0(sizeof(EnumRestriction));
-      r->base.col = col;
-      r->base.type = RestrictEnum;
-      r->include = palloc0(sizeof(int) * field->enum_count); //max size
-      return (RestrictionBase*)r;
-    }
-    default:
-    {
-      ereport(
-        WARNING,
-        (errmsg("internalized condition for type not suppored"),
-         errdetail("Field %s with value type %d", field->name, field->value_type)));
-    }
+  switch (field->value_type) {
+
+  case TypeInt32:
+  case TypeInt32Array: {
+    IntRestriction *r = palloc0(sizeof(IntRestriction));
+    r->base.col = col;
+    r->base.type = RestrictInt;
+    return (RestrictionBase *)r;
+  }
+
+  case TypeInt64: {
+    Int64Restriction *r = palloc0(sizeof(Int64Restriction));
+    r->base.col = col;
+    r->base.type = RestrictInt64;
+    return (RestrictionBase *)r;
+  }
+
+  case TypeFloat32:
+  case TypeFloat32Array:
+  case TypeFloat64:
+  case TypeFloat64Array: {
+    DoubleRestriction *r = palloc0(sizeof(DoubleRestriction));
+    r->base.col = col;
+    r->base.type = RestrictInt64;
+    return (RestrictionBase *)r;
+  }
+
+  case TypeEnum:
+  case TypeEnumArray: {
+    EnumRestriction *r = palloc0(sizeof(EnumRestriction));
+    r->base.col = col;
+    r->base.type = RestrictEnum;
+    r->include = palloc0(sizeof(int) * field->enum_count); // max size
+    return (RestrictionBase *)r;
+  }
+
+  case TypeBool:
+  case TypeBoolArray: {
+    BoolRestriction *r = palloc0(sizeof(BoolRestriction));
+    r->base.col = col;
+    r->base.type = RestrictBool;
+    r->includeTrue = false;
+    r->includeFalse = true;
+    return (RestrictionBase *)r;
+  }
+
+  case TypeString:
+  case TypeStringArray: {
+    StringRestriction *r = palloc0(sizeof(StringRestriction));
+    r->base.col = col;
+    r->base.type = RestrictString;
+    r->doesNotMatch = false;
+    return (RestrictionBase *)r;
+  }
+
+  default: {
+    ereport(WARNING, (errmsg("internalized condition for type not suppored"),
+                      errdetail("Field %s with value type %d", field->name,
+                                field->value_type)));
+  }
   }
   return NULL;
 }
@@ -1178,7 +1224,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags)
   }
   buildColumnRestrictions(executionState);
 
-  // elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId,
+  //elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId,
   // tsfFdwOptions->fieldType, list_length(columnList), list_length(foreignExprs));
 
   scanState->fdw_state = (void *)executionState;
@@ -1667,23 +1713,25 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
 
+  elog(WARNING, "isInternableRestriction::oid type %d",get_atttype(foreignTableId, qual->varattno));
   switch(get_atttype(foreignTableId, qual->varattno)) {
     case TEXTOID: {
       // ex. effectcombined = ANY ('{LoF,Missense}'::text[])
-      if(strcmp(qual->opname, "=") == 0 && qual->isArray && qual->useOr && qual->typeoid == TEXTARRAYOID)
+      if (strcmp(qual->opname, "=") == 0 && qual->isArray && qual->useOr &&
+          qual->typeoid == TEXTARRAYOID)
         return true;
       break;
     }
     case TEXTARRAYOID: {
       // ex. effect && '{LoF,Missense}'::text[]
-      if(strcmp(qual->opname, "&&") == 0 && !qual->isArray && !qual->useOr && qual->typeoid == TEXTARRAYOID)
+      if (strcmp(qual->opname, "&&") == 0 && !qual->isArray && !qual->useOr &&
+          qual->typeoid == TEXTARRAYOID)
         return true;
       break;
     }
   }
 
   // Look up the type for this field.
-
   elog(INFO, "%s[%d] %s isArray[%d] useOr[%d] typeoid[%d]", columnName, get_atttype(foreignTableId, qual->varattno), qual->opname, qual->isArray, qual->useOr, qual->typeoid);
 
   // TODO: check if clause is a expression that TSF can handle internally.
@@ -1716,7 +1764,7 @@ static bool isParamatizable(Oid foreignTableId, RelOptInfo *baserel, Expr *expr,
 
 static void parseQualIntoIdList(int **idList, int *idListCount, bool isNull, bool isArray,
                                 Datum value)
-{
+    {
   if (isNull) {
     free(*idList);
     *idList = calloc(sizeof(int), 1);  // non used, but must be not-null
@@ -1764,53 +1812,78 @@ static int findEnumIdx(tsf_field* field, const char* str)
   return -1;
 }
 
-static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field, MulticornBaseQual* qual, Datum value, bool isNull)
+static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
+                                 MulticornBaseQual *qual, Datum value,
+                                 bool isNull)
 {
-  switch(field->value_type) {
-    case TypeEnum:
-    case TypeEnumArray:
-    {
-      EnumRestriction* r = (EnumRestriction*)restriction;
+  switch (field->value_type) {
+  case TypeInt32:
+    case TypeInt32Array:{
+      IntRestriction* r = (IntRestriction*) restriction;
       r->base.includeMissing = false;
-      r->includeCount = 0;
-      if(isNull) {
+      if (isNull) {
         r->base.includeMissing = true;
         return;
       }
-      if(qual->typeoid == TEXTOID) {
-        const char* str = TextDatumGetCString(value);
+    }
+    
+  case TypeInt64:
+
+  case TypeFloat32:
+  case TypeFloat32Array:
+  case TypeFloat64:
+  case TypeFloat64Array: {
+
+  }
+
+  case TypeEnum:
+  case TypeEnumArray: {
+    EnumRestriction *r = (EnumRestriction *)restriction;
+    r->base.includeMissing = false;
+    r->includeCount = 0;
+    if (isNull) {
+      r->base.includeMissing = true;
+      return;
+    }
+    if (qual->typeoid == TEXTOID) {
+      const char *str = TextDatumGetCString(value);
+      int enumIdx = findEnumIdx(field, str);
+      if (enumIdx >= 0) {
+        r->include[r->includeCount++] = enumIdx;
+      }
+    } else if (qual->typeoid == TEXTARRAYOID) {
+      ArrayType *strArray = DatumGetArrayTypeP(value);
+      ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
+
+      Datum itrValue;
+      bool itrIsNull;
+      while (array_iterate(iterator, &itrValue, &itrIsNull)) {
+        if (itrIsNull) {
+          r->base.includeMissing = true;
+          continue;
+        }
+        char *str = TextDatumGetCString(itrValue);
         int enumIdx = findEnumIdx(field, str);
-        if(enumIdx >= 0) {
+        if (enumIdx >= 0) {
           r->include[r->includeCount++] = enumIdx;
         }
       }
-      else if(qual->typeoid == TEXTARRAYOID) {
-        ArrayType* strArray = DatumGetArrayTypeP(value);
-        ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
+    }
+    return;
+  }
+  case TypeBool:
+  case TypeBoolArray: {
+  }
 
-        Datum itrValue;
-        bool itrIsNull;
-        while(array_iterate(iterator, &itrValue, &itrIsNull)) {
-          if(itrIsNull) {
-            r->base.includeMissing = true;
-            continue;
-          }
-          char *str = TextDatumGetCString(itrValue);
-          int enumIdx = findEnumIdx(field, str);
-          if(enumIdx >= 0) {
-            r->include[r->includeCount++] = enumIdx;
-          }
-        }
-      }
-      return;
-    }
-    default:
-    {
-      ereport(
-        WARNING,
-        (errmsg("internalized condition for type not suppored"),
-         errdetail("Field %s with value type %d", field->name, field->value_type)));
-    }
+  case TypeString:
+  case TypeStringArray: {
+  }
+    
+  default: {
+    ereport(WARNING, (errmsg("internalized condition for type not suppored"),
+                      errdetail("Field %s with value type %d", field->name,
+                                field->value_type)));
+  }
   }
 }
 

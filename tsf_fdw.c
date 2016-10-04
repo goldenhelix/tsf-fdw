@@ -28,6 +28,7 @@
 #include "tsf_fdw.h"
 
 #include <sys/stat.h>
+#include <limits.h>
 
 #include "tsf.h"
 #include "stringbuilder.h"
@@ -58,8 +59,11 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/rangetypes.h"
+
 
 #if PG_VERSION_NUM >= 90300
 #include "access/htup_details.h"
@@ -974,7 +978,6 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
    * Separate the scan_clauses into those that can be executed
    * internally and those that can't.
    */
-  elog(WARNING,"Test logging");
   ListCell *lc = NULL;
   bool foundIdRestriction = false;
   foreach (lc, scanClauses) {
@@ -989,7 +992,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
     List *quals = NIL;
     extractRestrictions(baserel->relids, rinfo->clause, &quals);
 
-    elog(WARNING, "quals %d", list_length(quals));
+    elog(WARNING, "restrictions extracted: %d", list_length(quals));
     if (list_length(quals) == 1) {
       MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
       // ID restrictions must be only internalized expressions if they
@@ -1001,6 +1004,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
       } else if (isEntityIdRestriction(foreignTableId, qual)) {
         entityIdClause = rinfo->clause;  // Compatible with ID restrictions, so don't set tsfExprs
       } else if (!foundIdRestriction && isInternableRestriction(foreignTableId, qual)) {
+        elog(WARNING, "restriction is internable");
         tsfExprs = lappend(tsfExprs, rinfo->clause);
       } else {
         localExprs = lappend(localExprs, rinfo->clause);  // We don't hanle
@@ -1075,9 +1079,12 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
     IntRestriction *r = palloc0(sizeof(IntRestriction));
     r->base.col = col;
     r->base.type = RestrictInt;
+    r->lowerBound = INT_MIN;
+    r->upperBound = INT_MAX;
     return (RestrictionBase *)r;
   }
 
+  // TODO: Set min and max default bounds
   case TypeInt64: {
     Int64Restriction *r = palloc0(sizeof(Int64Restriction));
     r->base.col = col;
@@ -1709,12 +1716,48 @@ static bool isEntityIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
   return false;
 }
 
+static bool numericCompareOperator(const char* optString)
+{
+  if (strcmp(optString, "=") == 0)
+    return true;
+  if (strcmp(optString, "<=") == 0)
+    return true;
+  if (strcmp(optString, ">=") == 0)
+    return true;
+  if (strcmp(optString, "<>") == 0)
+    return true;
+  if (strcmp(optString, "<") == 0)
+    return true;
+  if (strcmp(optString, ">") == 0)
+    return true;
+  return false;
+}
+
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
 
   elog(WARNING, "isInternableRestriction::oid type %d",get_atttype(foreignTableId, qual->varattno));
+  //TODO: May need to update this to me a little more strict
   switch(get_atttype(foreignTableId, qual->varattno)) {
+    case INT4OID:
+    case INT2OID:{
+      if(!qual->isArray || !qual->useOr)
+        return false;
+      if(!numericCompareOperator(qual->opname))
+        return false;
+      return true;
+    }
+    case INT4ARRAYOID:
+    case INT2ARRAYOID:{
+      if(!qual->isArray || !qual->useOr)
+        return false;
+      // TODO: This need to be updated for list operators '<@'
+      //if(!numericCompareOperator(qual->opname))
+      //      return false;
+      elog(WARNING, "operator: %s", qual->opname); 
+      return true;
+    }
     case TEXTOID: {
       // ex. effectcombined = ANY ('{LoF,Missense}'::text[])
       if (strcmp(qual->opname, "=") == 0 && qual->isArray && qual->useOr &&
@@ -1812,28 +1855,183 @@ static int findEnumIdx(tsf_field* field, const char* str)
   return -1;
 }
 
+static bool includeBounds(const char* optString)
+{
+  if(strcmp(optString, "<=") == 0)
+    return true;
+
+  if(strcmp(optString, ">=") == 0)
+    return true;
+
+  return false;
+}
+
+static int numericToInt(Numeric num)
+{
+  char *valStr = numeric_out_sci(num, 0);
+  double numValue = strtod(valStr, NULL);
+  int retValue = (int)numValue;
+
+  if (((double)retValue) != numValue) {
+    ereport(WARNING, (errmsg("Could not cast query value to int"),
+                      errdetail("Value %s", valStr)));
+  }
+
+  return retValue;
+}
+
+static int64_t numericToInt64(Numeric num)
+{
+  char *valStr = numeric_out_sci(num, 0);
+  double numValue = strtod(valStr, NULL);
+  int64_t retValue = (int64_t)numValue;
+
+  if (((double)retValue) != numValue) {
+    ereport(WARNING, (errmsg("Could not cast query value to int"),
+                      errdetail("Value %s", valStr)));
+  }
+
+  return retValue;
+}
+
+static double numericToDouble(Numeric num)
+{
+  char *valStr = numeric_out_sci(num, 0);
+  return strtod(valStr, NULL);
+}
+
 static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
                                  MulticornBaseQual *qual, Datum value,
-                                 bool isNull)
-{
+                                 bool isNull) {
   switch (field->value_type) {
   case TypeInt32:
-    case TypeInt32Array:{
-      IntRestriction* r = (IntRestriction*) restriction;
-      r->base.includeMissing = false;
-      if (isNull) {
-        r->base.includeMissing = true;
-        return;
-      }
+  case TypeInt32Array: {
+    IntRestriction *r = (IntRestriction *)restriction;
+    r->base.includeMissing = false;
+    if (isNull) {
+      r->base.includeMissing = true;
+      return;
     }
-    
-  case TypeInt64:
+
+    if (qual->typeoid == NUMERICOID) {
+      int bound = numericToInt(DatumGetNumeric(value));
+      if (qual->opname[0] == '<')
+        r->upperBound = bound;
+      else if (qual->opname[0] == '>')
+        r->lowerBound = bound;
+      
+      r->includeBounds = includeBounds(qual->opname);
+      return;
+
+    } else {                         // range type
+      Assert(qual->typeoid == 3906); // this doesnt have a sharp define
+      RangeType *range = DatumGetRangeType(value);
+
+      Oid rngtypid = RangeTypeGetOid(range);
+      TypeCacheEntry *typcache = lookup_type_cache(rngtypid, TYPECACHE_RANGE_INFO);
+      if (typcache->rngelemtype == NULL)
+        elog(ERROR, "type %u is not a range type", rngtypid);
+
+      RangeBound upper, lower;
+      bool empty;
+
+      range_deserialize(typcache, range, &lower, &upper, &empty);
+
+      r->lowerBound = numericToInt(DatumGetNumeric(lower.val));
+      r->upperBound = numericToInt(DatumGetNumeric(upper.val));
+      r->includeBounds = (upper.inclusive && lower.inclusive);
+      return;
+    }
+
+    break;
+  }
+
+  case TypeInt64: {
+    Int64Restriction *r = (Int64Restriction *)restriction;
+    r->base.includeMissing = false;
+    if (isNull) {
+      r->base.includeMissing = true;
+      return;
+    }
+
+    if (qual->typeoid == NUMERICOID) {
+      int64_t bound = numericToInt64(DatumGetNumeric(value));
+      if (qual->opname[0] == '<')
+        r->upperBound = bound;
+      if (qual->opname[0] == '>')
+        r->lowerBound = bound;
+
+      r->includeBounds = includeBounds(qual->opname);
+      return;
+
+    } else {                         // range
+      Assert(qual->typeoid == 3906); // this doesnt have a sharp define
+      RangeType *range = DatumGetRangeType(value);
+
+      Oid rngtypid = RangeTypeGetOid(range);
+      TypeCacheEntry *typcache =
+          lookup_type_cache(rngtypid, TYPECACHE_RANGE_INFO);
+      if (typcache->rngelemtype == NULL)
+        elog(ERROR, "type %u is not a range type", rngtypid);
+
+      RangeBound upper, lower;
+      bool empty;
+
+      range_deserialize(typcache, range, &lower, &upper, &empty);
+
+      r->lowerBound = numericToInt64(DatumGetNumeric(lower.val));
+      r->upperBound = numericToInt64(DatumGetNumeric(upper.val));
+      r->includeBounds = (upper.inclusive && lower.inclusive);
+      return;
+    }
+
+    // else range
+    break;
+  }
 
   case TypeFloat32:
   case TypeFloat32Array:
   case TypeFloat64:
   case TypeFloat64Array: {
+    DoubleRestriction *r = (DoubleRestriction *)restriction;
+    r->base.includeMissing = false;
+    if (isNull) {
+      r->base.includeMissing = true;
+      return;
+    }
 
+    if (qual->typeoid == NUMERICOID) {
+      double bound = numericToDouble(DatumGetNumeric(value));
+      if (qual->opname[0] == '<')
+        r->upperBound = bound;
+      if (qual->opname[0] == '>')
+        r->lowerBound = bound;
+
+      r->includeBounds = includeBounds(qual->opname);
+      return;
+
+    } else {                         // range
+      Assert(qual->typeoid == 3906); // this doesnt have a sharp define
+      RangeType *range = DatumGetRangeType(value);
+
+      Oid rngtypid = RangeTypeGetOid(range);
+      TypeCacheEntry *typcache =
+          lookup_type_cache(rngtypid, TYPECACHE_RANGE_INFO);
+      if (typcache->rngelemtype == NULL)
+        elog(ERROR, "type %u is not a range type", rngtypid);
+
+      RangeBound upper, lower;
+      bool empty;
+
+      range_deserialize(typcache, range, &lower, &upper, &empty);
+
+      r->lowerBound = numericToDouble(DatumGetNumeric(lower.val));
+      r->upperBound = numericToDouble(DatumGetNumeric(upper.val));
+      r->includeBounds = (upper.inclusive && lower.inclusive);
+      return;
+    }
+    // else range
+    break;
   }
 
   case TypeEnum:

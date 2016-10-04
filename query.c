@@ -226,13 +226,6 @@ ScalarArrayOpExpr *canonicalScalarArrayOpExpr(ScalarArrayOpExpr *opExpr, Relids 
     ReleaseSysCache(tp);
 
     swapOperandsAsNeeded(&l, &r, &operatorid, base_relids);
-    
-    elog(WARNING, "l:%s", nodeToString(l));
-    elog(WARNING, "r:%s", nodeToString(r));
-    elog(WARNING, "Scalar unnested : %d %d %d", IsA(l, Var),
-         bms_is_member(((Var *)l)->varno, base_relids),
-         ((Var *)l)->varattno >= 1);
-    
     if (IsA(l, Var) && bms_is_member(((Var *)l)->varno, base_relids) &&
         ((Var *)l)->varattno >= 1) {
       result = makeNode(ScalarArrayOpExpr);
@@ -244,7 +237,6 @@ ScalarArrayOpExpr *canonicalScalarArrayOpExpr(ScalarArrayOpExpr *opExpr, Relids 
       result->location = opExpr->location;
     }
   }
-  elog(WARNING, result ? "Scalar Create" : "Scalar Creation Failed!");
   return result;
 }
 
@@ -316,7 +308,6 @@ void extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *o
 
   op = canonicalScalarArrayOpExpr(op, base_relids);
   if (op) {
-    elog(WARNING, "split scalar array expr");
     left = list_nth(op->args, 0);
     right = list_nth(op->args, 1);
     if (!(contain_volatile_functions((Node *)right) ||
@@ -350,6 +341,9 @@ void extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
                       false);
     *quals = lappend(*quals, result);
   }
+
+  //check for list is null is more complex, can have clauses like:
+  // NOT -2147483648 = ALL(p_exampletumornormalpairanalysis2_19.samplecount2) IS NULL
 }
 
 /*
@@ -369,24 +363,26 @@ void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
   if (list_length(node->args) != 2)
     return;
 
-  OpExpr *expr = (Expr *)0;
-  ScalarArrayOpExpr *exprScalar = (Expr *)0;
-  NullTest *nullTest = (Expr *)0;
-  ListCell* lc;
-  
+  OpExpr *expr = (OpExpr *)0;
+  ScalarArrayOpExpr *exprScalar = (ScalarArrayOpExpr *)0;
+  NullTest *nullTest = (NullTest *)0;
+  ListCell *lc;
+
   foreach (lc, node->args) {
     Expr *subNode = lfirst(lc);
 
     switch (nodeTag(subNode)) {
     case T_ScalarArrayOpExpr:
-      exprScalar = subNode;
+      exprScalar = (ScalarArrayOpExpr *)subNode;
       break;
     case T_OpExpr:
-      expr = subNode;
+      expr = (OpExpr *)subNode;
       break;
     case T_NullTest:
-      nullTest = subNode;
+      nullTest = (NullTest *)subNode;
       break;
+    default:
+      return;
     }
   }
 
@@ -399,10 +395,16 @@ void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
   // elog(WARNING, "%s", nodeToString(exprScalar));
 
   //TODO: have to update this when is a scalar exptression checking for an 'Missing" value
+
+  Node * nullArg = (Node*)nullTest->arg;
+  nullArg = unnestClause(nullArg);
+
+  //TODO: make sure the null test and the expression have matchin variables
+
   if (!IsA(nullTest->arg, Var))
     return;
 
-  elog(WARNING, "IsVar");
+  //elog(WARNING, "IsVar");
   Var *var = (Var *)nullTest->arg;
   if (var->varattno < 1)
     return;
@@ -480,6 +482,7 @@ MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value, bool
 {
   MulticornBaseQual *qual;
 
+  elog(WARNING, "make qual expr: %s", nodeToString(value));
   switch (value->type) {
     case T_Const:
       qual = palloc0(sizeof(MulticornConstQual));
@@ -500,6 +503,7 @@ MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value, bool
       qual->typeoid = InvalidOid;
       break;
   }
+
   qual->varattno = varattno;
   qual->opname = opname;
   qual->isArray = isarray;

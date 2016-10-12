@@ -1738,7 +1738,7 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
 
   elog(WARNING, "isInternableRestriction::oid type %d",get_atttype(foreignTableId, qual->varattno));
-  //TODO: May need to update this to me a little more strict
+  //TODO: May need to update this to be a little more strict
   switch(get_atttype(foreignTableId, qual->varattno)) {
     case INT4OID:
     case INT2OID:{
@@ -1752,10 +1752,10 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
     case INT2ARRAYOID:{
       if(!qual->isArray || !qual->useOr)
         return false;
-      // TODO: This need to be updated for list operators '<@'
+      // TODO: This need to be updated to allow for list operators '<@'
       //if(!numericCompareOperator(qual->opname))
       //      return false;
-      elog(WARNING, "operator: %s", qual->opname); 
+      elog(WARNING, "operator: %s", qual->opname);
       return true;
     }
     case TEXTOID: {
@@ -1772,6 +1772,8 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
         return true;
       break;
     }
+    case BOOLOID:
+      return true;
   }
 
   // Look up the type for this field.
@@ -1903,15 +1905,16 @@ static double numericToDouble(Numeric num)
 static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
                                  MulticornBaseQual *qual, Datum value,
                                  bool isNull) {
+  restriction->includeMissing = qual->includeMissing;
+  if (isNull) {
+    restriction->includeMissing = true;
+    return;
+  }
+
   switch (field->value_type) {
   case TypeInt32:
   case TypeInt32Array: {
     IntRestriction *r = (IntRestriction *)restriction;
-    r->base.includeMissing = false;
-    if (isNull) {
-      r->base.includeMissing = true;
-      return;
-    }
 
     if (qual->typeoid == NUMERICOID) {
       int bound = numericToInt(DatumGetNumeric(value));
@@ -1919,7 +1922,7 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
         r->upperBound = bound;
       else if (qual->opname[0] == '>')
         r->lowerBound = bound;
-      
+
       r->includeBounds = includeBounds(qual->opname);
       return;
 
@@ -1948,12 +1951,6 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
   case TypeInt64: {
     Int64Restriction *r = (Int64Restriction *)restriction;
-    r->base.includeMissing = false;
-    if (isNull) {
-      r->base.includeMissing = true;
-      return;
-    }
-
     if (qual->typeoid == NUMERICOID) {
       int64_t bound = numericToInt64(DatumGetNumeric(value));
       if (qual->opname[0] == '<')
@@ -1994,12 +1991,6 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeFloat64:
   case TypeFloat64Array: {
     DoubleRestriction *r = (DoubleRestriction *)restriction;
-    r->base.includeMissing = false;
-    if (isNull) {
-      r->base.includeMissing = true;
-      return;
-    }
-
     if (qual->typeoid == NUMERICOID) {
       double bound = numericToDouble(DatumGetNumeric(value));
       if (qual->opname[0] == '<')
@@ -2037,12 +2028,8 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeEnum:
   case TypeEnumArray: {
     EnumRestriction *r = (EnumRestriction *)restriction;
-    r->base.includeMissing = false;
     r->includeCount = 0;
-    if (isNull) {
-      r->base.includeMissing = true;
-      return;
-    }
+
     if (qual->typeoid == TEXTOID) {
       const char *str = TextDatumGetCString(value);
       int enumIdx = findEnumIdx(field, str);
@@ -2050,7 +2037,7 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
         r->include[r->includeCount++] = enumIdx;
       }
     } else if (qual->typeoid == TEXTARRAYOID) {
-      ArrayType *strArray = DatumGetArrayTypeP(value);
+      ArrayType *strArray = print DatumGetArrayTypeP(value);
       ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
 
       Datum itrValue;
@@ -2071,12 +2058,22 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   }
   case TypeBool:
   case TypeBoolArray: {
+    BoolRestriction *r = (BoolRestriction *)restriction;
+    if (qual->typeoid == BOOLOID) {
+      //only cheking for a single value
+      r->includeTrue = (strcmp(qual->opname, "True") == 0);
+      r->includeFalse = (strcmp(qual->opname, "False") == 0);
+    }else if(qual->typeoid == 1000){//BOOARRAYOID (no # define)
+      //multiple values has to be -> true and false
+      r->includeTrue = r->includeTrue = true;
+    }
+    return;
   }
 
   case TypeString:
   case TypeStringArray: {
   }
-    
+
   default: {
     ereport(WARNING, (errmsg("internalized condition for type not suppored"),
                       errdetail("Field %s with value type %d", field->name,
@@ -2101,9 +2098,13 @@ static void executeQualList(ForeignScanState *scanState, bool dontUpdateConst, b
     bool usable = false;
 
     switch (qual->right_type) {
+      case T_Var:
+        // for fields(vars) the field is all we need
+        // this should only happen for boolean fields
+        usable = true;
       case T_Param:
         usable = true;
-        expr_state = ExecInitExpr(((MulticornParamQual *)qual)->expr, (PlanState *)scanState);
+        expr_state = ExecInitExpr(((MulticornParamQual*)qual)->expr, (PlanState *)scanState);
         value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
         break;
       case T_Const:

@@ -24,18 +24,20 @@
 #include "utils/lsyscache.h"
 #include "parser/parsetree.h"
 
-void extractClauseFromOpExpr(Relids base_relids, OpExpr *node, List **quals);
+bool extractClauseFromOpExpr(Relids base_relids, OpExpr *node, List **quals);
 
-void extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals);
+bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals);
 
-void extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *node, List **quals);
+bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *node, List **quals);
 
-void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals);
+bool extractClauseFromBoolVar(Relids base_relids, Var *node, List **quals, bool value);
+
+bool extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals);
 
 char *getOperatorString(Oid opoid);
 
 MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value, bool isarray,
-                            bool useOr);
+                            bool useOr, bool includeMissing);
 
 Node *unnestClause(Node *node);
 void swapOperandsAsNeeded(Node **left, Node **right, Oid *opoid, Relids base_relids);
@@ -250,24 +252,25 @@ void extractRestrictions(Relids base_relids, Expr *node, List **quals)
   switch (nodeTag(node)) {
     case T_OpExpr:
       extractClauseFromOpExpr(base_relids, (OpExpr *)node, quals);
-      break;
+      return;
     case T_NullTest:
       extractClauseFromNullTest(base_relids, (NullTest *)node, quals);
-      break;
+      return;
     case T_ScalarArrayOpExpr:
       extractClauseFromScalarArrayOpExpr(base_relids, (ScalarArrayOpExpr *)node, quals);
-      break;
+      return;
     case T_BoolExpr:
       extractClauseFromBoolExpr(base_relids, (BoolExpr *)node, quals);
-      break;
+      return;
+    case T_Var:
+      extractClauseFromBoolVar(base_relids, (Var*) node, quals, true);
+      return;
     default: {
-      ereport(WARNING,
-              (errmsg(
-                   "unsupported expression for "
-                   "extractClauseFrom"),
-               errdetail("%s", nodeToString(node))));
     } break;
   }
+  ereport(WARNING, (errmsg("unsupported expression for "
+                           "extractClauseFrom"),
+                    errdetail("%s", nodeToString(node))));
 }
 
 /*
@@ -280,7 +283,7 @@ void extractRestrictions(Relids base_relids, Expr *node, List **quals)
  *	- Const operator: the operator representation
  *	- Var or Const value: the value.
  */
-void extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
+bool extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
 {
   Var *left;
   Expr *right;
@@ -288,80 +291,135 @@ void extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
   /* Use a "canonical" version of the op expression, to ensure that the */
   /* left operand is a Var on our relation. */
   op = canonicalOpExpr(op, base_relids);
-  if (op) {
-    left = list_nth(op->args, 0);
-    right = list_nth(op->args, 1);
-    /* Do not add it if it either contains a mutable function, or makes */
-    /* self references in the right hand side. */
-    if (!(contain_volatile_functions((Node *)right) ||
-          bms_is_subset(base_relids, pull_varnos((Node *)right)))) {
-      *quals = lappend(*quals,
-                       makeQual(left->varattno, getOperatorString(op->opno), right, false, false));
-    }
-  }
+  if (!op)
+    return false;
+
+  left = list_nth(op->args, 0);
+  right = list_nth(op->args, 1);
+
+  /* Do not add it if it either contains a mutable function, or makes */
+  /* self references in the right hand side. */
+  if (contain_volatile_functions((Node *)right))
+    return true;
+
+  if (bms_is_subset(base_relids, pull_varnos((Node *)right)))
+    return true;
+
+  *quals = lappend(*quals, makeQual(left->varattno, getOperatorString(op->opno),
+                                    right, false, /*use or*/ false,
+                                    /*include missing*/ false));
+
+  return true;
 }
 
-void extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *op, List **quals)
+bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *op, List **quals)
 {
   Var *left;
   Expr *right;
 
   op = canonicalScalarArrayOpExpr(op, base_relids);
-  if (op) {
-    left = list_nth(op->args, 0);
-    right = list_nth(op->args, 1);
-    if (!(contain_volatile_functions((Node *)right) ||
-          bms_is_subset(base_relids, pull_varnos((Node *)right)))) {
-      *quals = lappend(
-          *quals, makeQual(left->varattno, getOperatorString(op->opno), right, true, op->useOr));
-    }
-  }
+  if (!op)
+    return false;
+
+  left = list_nth(op->args, 0);
+  right = list_nth(op->args, 1);
+
+  // elog(WARNING, "Check var right");
+  if (contain_volatile_functions((Node *)right))
+    return false;
+
+  if (bms_is_subset(base_relids, pull_varnos((Node *)right)))
+    return false;
+
+  *quals = lappend(*quals,
+                   makeQual(left->varattno, getOperatorString(op->opno), right,
+                            true, op->useOr, /*include missing*/ false));
+
+  return true;
 }
 
 /*
  *	Convert a "NullTest" (IS NULL, or IS NOT NULL)
  *	to a suitable intermediate representation.
  */
-void extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
+bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
 {
-  if (IsA(node->arg, Var)) {
-    Var *var = (Var *)node->arg;
-    MulticornBaseQual *result;
-    char *opname = NULL;
+  if (!IsA(node->arg, Var))
+    return false;
 
-    if (var->varattno < 1) {
-      return;
-    }
-    if (node->nulltesttype == IS_NULL) {
-      opname = "=";
-    } else {
-      opname = "<>";
-    }
-    result = makeQual(var->varattno, opname, (Expr *)makeNullConst(INT4OID, -1, InvalidOid), false,
-                      false);
-    *quals = lappend(*quals, result);
+  Var *var = (Var *)node->arg;
+  MulticornBaseQual *result;
+  char *opname = NULL;
+
+  if (var->varattno < 1)
+    return false;
+
+  if (node->nulltesttype == IS_NULL) {
+    opname = "=";
+  } else {
+    opname = "<>";
   }
 
-  //check for list is null is more complex, can have clauses like:
-  // NOT -2147483648 = ALL(p_exampletumornormalpairanalysis2_19.samplecount2) IS NULL
+  result = makeQual(var->varattno, opname,
+                    (Expr *)makeNullConst(INT4OID, -1, InvalidOid), false,
+                    /*use or*/ false,
+                    /*include missing*/ node->nulltesttype == IS_NULL);
+
+  *quals = lappend(*quals, result);
+
+  return true;
+}
+
+/*
+ *  When a variable is the entire expression (bool fields) we extract the value
+ *  and save the desired state in the operator [True|False]
+ */
+bool extractClauseFromBoolVar(Relids base_relids, Var *varNode, List **quals, bool value)
+{
+  if(varNode->vartype != BOOLOID)
+    return false;
+
+  char* opname = NULL; 
+  if(value)
+    opname = "True";
+  else
+    opname = "False";
+
+  quals = lappend(*quals,
+                  makeQual(varNode->varattno, opname, (Expr*)varNode, /* is array*/ false,
+                           /*useOr*/ false, /*includeMissing*/ false));
+  return true;
+}
+
+bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **quals)
+{
+  if (op->boolop != NOT_EXPR)
+    return false;
+
+  // handle inverted clauses on boolean fields(i.e. field == False)
+  if (list_length(op->args) != 1)
+    return false;
+
+  Expr *arg = (Expr *)list_nth(op->args, 0);
+
+  if (!IsA(arg, Var))
+    return false;
+
+  return extractClauseFromBoolVar(base_relids, (Var *)arg, quals,
+                                  /*not this*/ false);
 }
 
 /*
  *  Convert a BoolExpr [Not|Or|And] to a intermediate representation
  */
-void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
+bool extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
 {
-  switch (node->boolop) {
-  case AND_EXPR:
-  case NOT_EXPR:
-    return;
-  case OR_EXPR:
-    break;
-  }
+  if(node->boolop != OR_EXPR)
+    return false;
 
   // only lookgin for nodes with an expression followed by a "NullTest"
   if (list_length(node->args) != 2)
-    return;
+    return false;
 
   OpExpr *expr = (OpExpr *)0;
   ScalarArrayOpExpr *exprScalar = (ScalarArrayOpExpr *)0;
@@ -381,8 +439,11 @@ void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
     case T_NullTest:
       nullTest = (NullTest *)subNode;
       break;
+    case T_BoolExpr:
+      return false;
+
     default:
-      return;
+      return false;
     }
   }
 
@@ -401,15 +462,15 @@ void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
 
   //TODO: make sure the null test and the expression have matchin variables
 
-  if (!IsA(nullTest->arg, Var))
-    return;
+  //if (!IsA(nullTest->arg, Var))
+  //  return;
 
   //elog(WARNING, "IsVar");
-  Var *var = (Var *)nullTest->arg;
-  if (var->varattno < 1)
-    return;
+  //Var *var = (Var *)nullTest->arg;
+  //if (var->varattno < 1)
+  //  return;
 
-  bool includeMissing = (nullTest->nulltesttype == IS_NULL);
+  bool inclMissing = (nullTest->nulltesttype == IS_NULL);
 
   // check the expression
   MulticornBaseQual *qual;
@@ -426,13 +487,13 @@ void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
     /* Do not add it if it either contains a mutable function, or makes */
     /* self references in the right hand side. */
     if (contain_volatile_functions((Node *)right))
-      return;
+      return false;
 
     if (bms_is_subset(base_relids, pull_varnos((Node *)right)))
-      return;
+      return false;
 
     qual = makeQual(left->varattno, getOperatorString(expr->opno), right, false,
-                    false);
+                    /*use or*/ false, inclMissing);
   } else {
     Assert(exprScalar);
 
@@ -446,18 +507,17 @@ void extractClauseFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals)
 
     //elog(WARNING, "Check var right");
     if (contain_volatile_functions((Node *)right))
-      return;
+      return false;
 
     if (bms_is_subset(base_relids, pull_varnos((Node *)right)))
-      return;
+      return false;
 
     qual = makeQual(left->varattno, getOperatorString(exprScalar->opno), right, true,
-                    exprScalar->useOr);
+                    exprScalar->useOr, inclMissing);
   }
 
-  qual->includeMissing = includeMissing;
-
   *quals = lappend(*quals, qual);
+  return true;
 }
 /*
  *	Returns a "Value" node containing the string name of the column from a var.
@@ -477,9 +537,8 @@ Value *colnameFromVar(Var *var, PlannerInfo *root, MulticornPlanState *planstate
 /*
  *	Build an opaque "qual" object.
  */
-MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value, bool isarray,
-                            bool useOr)
-{
+MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value,
+                            bool isarray, bool useOr, bool includeMissing) {
   MulticornBaseQual *qual;
 
   elog(WARNING, "make qual expr: %s", nodeToString(value));
@@ -508,7 +567,7 @@ MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value, bool
   qual->opname = opname;
   qual->isArray = isarray;
   qual->useOr = useOr;
-  qual->includeMissing = false;
+  qual->includeMissing = includeMissing;
   return qual;
 }
 
@@ -630,3 +689,4 @@ void findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int 
     }
   }
 }
+ 

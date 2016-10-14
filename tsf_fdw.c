@@ -29,6 +29,7 @@
 
 #include <sys/stat.h>
 #include <limits.h>
+#include <float.h>
 
 #include "tsf.h"
 #include "stringbuilder.h"
@@ -76,6 +77,10 @@
 #ifndef USE_FLOAT8_BYVAL
 #error "Only 64-bit machines supported. USE_FLOAT8_BYVAL must be set"
 #endif
+
+#ifndef NUMERICRANGEOID
+#define NUMERICRANGEOID 3906
+#endif 
 
 //#define REPORT_ITER_STATS 1
 
@@ -147,21 +152,24 @@ typedef struct IntRestriction {
   RestrictionBase base;
   int lowerBound;
   int upperBound;
-  bool includeBounds;  // Operation is >= and <=, not > and <
+  bool includeLowerBound;
+  bool includeUpperBound;
 } IntRestriction;
 
 typedef struct Int64Restriction {
   RestrictionBase base;
   int64_t lowerBound;
   int64_t upperBound;
-  bool includeBounds;  // Operation is >= and <=, not > and <
+  bool includeLowerBound;
+  bool includeUpperBound;
 } Int64Restriction;
 
 typedef struct DoubleRestriction {
   RestrictionBase base;
   double lowerBound;
   double upperBound;
-  bool includeBounds;  // Operation is >= and <=, not > and <
+  bool includeLowerBound;
+  bool includeUpperBound;
 } DoubleRestriction;
 
 typedef struct EnumRestriction {
@@ -178,7 +186,9 @@ typedef struct BoolRestriction {
 
 typedef struct StringRestriction {
   RestrictionBase base;
-  const char *match;  // Exact match
+  int matchCount;
+  Size matchSize;
+  char *match;  // Exact match
   bool doesNotMatch;
 } StringRestriction;
 
@@ -336,7 +346,6 @@ static void createTableSchema(stringbuilder *str, const char *prefix, const char
                               const char *tableSuffix)
 {
   char *buf = 0;
-
   // Locus attr field table
   bool foundOne = false;
   for (int i = 0; i < s->field_count; i++) {
@@ -992,7 +1001,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
     List *quals = NIL;
     extractRestrictions(baserel->relids, rinfo->clause, &quals);
 
-    elog(WARNING, "restrictions extracted: %d", list_length(quals));
+    //elog(WARNING, "restrictions extracted: %d", list_length(quals));
     if (list_length(quals) == 1) {
       MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
       // ID restrictions must be only internalized expressions if they
@@ -1004,7 +1013,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
       } else if (isEntityIdRestriction(foreignTableId, qual)) {
         entityIdClause = rinfo->clause;  // Compatible with ID restrictions, so don't set tsfExprs
       } else if (!foundIdRestriction && isInternableRestriction(foreignTableId, qual)) {
-        elog(WARNING, "restriction is internable");
+        elog(INFO, "restriction is internable");
         tsfExprs = lappend(tsfExprs, rinfo->clause);
       } else {
         localExprs = lappend(localExprs, rinfo->clause);  // We don't hanle
@@ -1079,16 +1088,17 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
     IntRestriction *r = palloc0(sizeof(IntRestriction));
     r->base.col = col;
     r->base.type = RestrictInt;
-    r->lowerBound = INT_MIN;
-    r->upperBound = INT_MAX;
+    r->upperBound = INT_MIN;
+    r->lowerBound = INT_MAX;
     return (RestrictionBase *)r;
   }
 
-  // TODO: Set min and max default bounds
   case TypeInt64: {
     Int64Restriction *r = palloc0(sizeof(Int64Restriction));
     r->base.col = col;
     r->base.type = RestrictInt64;
+    r->upperBound = INT64_MIN;
+    r->lowerBound = INT64_MAX;
     return (RestrictionBase *)r;
   }
 
@@ -1099,6 +1109,14 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
     DoubleRestriction *r = palloc0(sizeof(DoubleRestriction));
     r->base.col = col;
     r->base.type = RestrictInt64;
+    r->upperBound = FLT_MIN;
+    r->lowerBound = FLT_MAX;
+
+    if (field->value_type == TypeFloat32 || field->value_type == TypeFloat32Array)
+      return (RestrictionBase *)r;
+
+    r->upperBound = DBL_MIN;
+    r->lowerBound = DBL_MAX;
     return (RestrictionBase *)r;
   }
 
@@ -1127,6 +1145,9 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
     r->base.col = col;
     r->base.type = RestrictString;
     r->doesNotMatch = false;
+    r->matchCount = 0;
+    r->matchSize = 0;
+    r->match = NULL;
     return (RestrictionBase *)r;
   }
 
@@ -1229,6 +1250,10 @@ static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags)
                         ((Expr *)lfirst(lc)),
                         &executionState->qualList);
   }
+  // remove 'is null' quals when the can be summarized in the is missing
+  // parameter of anouther qual
+  collapseNullQuals(&executionState->qualList);
+
   buildColumnRestrictions(executionState);
 
   //elog(INFO, "%s[%d][%d], cols %d quals %d", __func__, executionState->sourceId,
@@ -1733,56 +1758,118 @@ static bool numericCompareOperator(const char* optString)
   return false;
 }
 
+static bool arrayCompareOperator(const char* optString)
+{
+  // ex. p_exampletumornormalpairanalysis2_19.id @> ARRAY['rs2271500']::text[]
+  if (strcmp(optString, "<@") == 0)
+    return true;
+  if (strcmp(optString, "@>") == 0)
+    return true;
+
+  return false;
+}
+
+static bool textArrayCompareOpterator(const char* optString)
+{
+  if(arrayCompareOperator(optString))
+    return true;
+
+  // ex. effect && '{LoF,Missense}'::text[]
+  if (strcmp(optString, "&&") == 0)
+    return true;
+
+  return false;
+}
+
+static bool textCompareOperator(const char* optString)
+{
+  if (strcmp(optString, "=") == 0)
+    return true;
+  if (strcmp(optString, "<>") == 0)
+    return true;
+  if (strcmp(optString, "!=") == 0)
+    return true;
+
+  return false;
+}
+
+
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
 
-  elog(WARNING, "isInternableRestriction::oid type %d",get_atttype(foreignTableId, qual->varattno));
+  //elog(WARNING, "isInternableRestriction::oid type %d",
+  //     get_atttype(foreignTableId, qual->varattno));
+
+  int attType = get_atttype(foreignTableId, qual->varattno);
+
   //TODO: May need to update this to be a little more strict
-  switch(get_atttype(foreignTableId, qual->varattno)) {
+  switch(attType) {
     case INT4OID:
-    case INT2OID:{
-      if(!qual->isArray || !qual->useOr)
-        return false;
+    case INT2OID:
+      // isArray and useOr may be null for is 'null'quals (const type)
+      if (qual->isArray != qual->useOr)
+        break;
       if(!numericCompareOperator(qual->opname))
-        return false;
+        break;
+      if (qual->typeoid != NUMERICOID  && qual->typeoid != NUMERICRANGEOID)
+        break;
       return true;
-    }
+
     case INT4ARRAYOID:
-    case INT2ARRAYOID:{
-      if(!qual->isArray || !qual->useOr)
-        return false;
-      // TODO: This need to be updated to allow for list operators '<@'
-      //if(!numericCompareOperator(qual->opname))
-      //      return false;
-      elog(WARNING, "operator: %s", qual->opname);
+    case INT2ARRAYOID:
+      if (qual->isArray != qual->useOr)
+        break;
+      if (!numericCompareOperator(qual->opname) &&
+          !arrayCompareOperator(qual->opname))
+        break;
+      if (qual->typeoid != NUMERICOID && qual->typeoid != NUMERICRANGEOID)
+        break;
       return true;
-    }
-    case TEXTOID: {
+
+    case FLOAT4OID:
+    case FLOAT8OID:
+    case FLOAT4ARRAYOID:
+    case 1022: //FLOAT8ARRAYOID: //no #define
+      if (qual->isArray != qual->useOr)
+        break;
+      if (!numericCompareOperator(qual->opname) &&
+          !arrayCompareOperator(qual->opname))
+        break;
+      if (qual->typeoid != NUMERICOID && qual->typeoid != NUMERICRANGEOID)
+        break;
+
+      return true;
+
+    case TEXTOID:
+      if (qual->isArray != qual->useOr)
+        break;
       // ex. effectcombined = ANY ('{LoF,Missense}'::text[])
-      if (strcmp(qual->opname, "=") == 0 && qual->isArray && qual->useOr &&
-          qual->typeoid == TEXTARRAYOID)
-        return true;
-      break;
-    }
-    case TEXTARRAYOID: {
-      // ex. effect && '{LoF,Missense}'::text[]
-      if (strcmp(qual->opname, "&&") == 0 && !qual->isArray && !qual->useOr &&
-          qual->typeoid == TEXTARRAYOID)
-        return true;
-      break;
-    }
+      if (!textCompareOperator(qual->opname))
+        break;
+      if(qual->typeoid != TEXTARRAYOID)
+        break;
+      return true;
+
+    case TEXTARRAYOID:
+      if(!textArrayCompareOpterator(qual->opname))
+        break;
+      if (qual->typeoid != TEXTARRAYOID)
+        break;;
+      return true;
+
     case BOOLOID:
+      if(qual->typeoid != BOOLOID)
+        return false;
       return true;
   }
 
   // Look up the type for this field.
-  elog(INFO, "%s[%d] %s isArray[%d] useOr[%d] typeoid[%d]", columnName, get_atttype(foreignTableId, qual->varattno), qual->opname, qual->isArray, qual->useOr, qual->typeoid);
+  elog(INFO, "isInternableFailed! %s[%d] %s isArray[%d] useOr[%d] typeoid[%d]",
+       columnName, get_atttype(foreignTableId, qual->varattno), qual->opname,
+       qual->isArray, qual->useOr, qual->typeoid);
 
-  // TODO: check if clause is a expression that TSF can handle internally.
-  // For example:
-  // tsf_variable <supported_operator> sub_expression
-  return false;  // Not yet implemented
+  return false;
 }
 
 /*
@@ -1857,17 +1944,6 @@ static int findEnumIdx(tsf_field* field, const char* str)
   return -1;
 }
 
-static bool includeBounds(const char* optString)
-{
-  if(strcmp(optString, "<=") == 0)
-    return true;
-
-  if(strcmp(optString, ">=") == 0)
-    return true;
-
-  return false;
-}
-
 static int numericToInt(Numeric num)
 {
   char *valStr = numeric_out_sci(num, 0);
@@ -1902,6 +1978,37 @@ static double numericToDouble(Numeric num)
   return strtod(valStr, NULL);
 }
 
+static char *appendCharStringRestriction(char *old, const char *append, Size *size,
+                                         int *count) {
+  Size oldSize = *size;
+  *size = sizeof(char*) * (oldSize + strlen(append) + 1 /* for null */);
+
+  char* out = NULL;
+  if(!old || oldSize == 0){
+    old = NULL;
+    out = (char*) palloc(*size);
+  }else{
+    out = repalloc(old, *size);
+  }
+
+  if (!out) {
+    ereport(WARNING, (errmsg("Can not compare strings"),
+                      errdetail("Could not allocate additional string comparison value")));
+    *size = oldSize;
+    return old;
+  }
+
+  char * appendLoc = out; 
+  if(old){
+    strncpy(appendLoc, old, oldSize);
+    appendLoc = (&appendLoc[oldSize])+ 1 /* skip null char */;
+  }
+
+  *count = *count + 1;
+  strncpy(appendLoc, append, strlen(append) + 1);
+  return out;
+}
+
 static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
                                  MulticornBaseQual *qual, Datum value,
                                  bool isNull) {
@@ -1916,6 +2023,8 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeInt32Array: {
     IntRestriction *r = (IntRestriction *)restriction;
 
+    r->lowerBound = INT_MIN;
+    r->upperBound = INT_MAX;
     if (qual->typeoid == NUMERICOID) {
       int bound = numericToInt(DatumGetNumeric(value));
       if (qual->opname[0] == '<')
@@ -1923,11 +2032,12 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       else if (qual->opname[0] == '>')
         r->lowerBound = bound;
 
-      r->includeBounds = includeBounds(qual->opname);
+      r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
+      r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
       return;
 
     } else {                         // range type
-      Assert(qual->typeoid == 3906); // this doesnt have a sharp define
+      Assert(qual->typeoid == NUMERICRANGEOID); 
       RangeType *range = DatumGetRangeType(value);
 
       Oid rngtypid = RangeTypeGetOid(range);
@@ -1942,7 +2052,8 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
       r->lowerBound = numericToInt(DatumGetNumeric(lower.val));
       r->upperBound = numericToInt(DatumGetNumeric(upper.val));
-      r->includeBounds = (upper.inclusive && lower.inclusive);
+      r->includeLowerBound = lower.inclusive;
+      r->includeUpperBound = upper.inclusive;
       return;
     }
 
@@ -1951,6 +2062,8 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
   case TypeInt64: {
     Int64Restriction *r = (Int64Restriction *)restriction;
+    r->lowerBound = INT64_MIN;
+    r->upperBound = INT64_MAX;
     if (qual->typeoid == NUMERICOID) {
       int64_t bound = numericToInt64(DatumGetNumeric(value));
       if (qual->opname[0] == '<')
@@ -1958,11 +2071,12 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       if (qual->opname[0] == '>')
         r->lowerBound = bound;
 
-      r->includeBounds = includeBounds(qual->opname);
+      r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
+      r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
       return;
 
     } else {                         // range
-      Assert(qual->typeoid == 3906); // this doesnt have a sharp define
+      Assert(qual->typeoid == NUMERICRANGEOID); 
       RangeType *range = DatumGetRangeType(value);
 
       Oid rngtypid = RangeTypeGetOid(range);
@@ -1978,7 +2092,8 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
       r->lowerBound = numericToInt64(DatumGetNumeric(lower.val));
       r->upperBound = numericToInt64(DatumGetNumeric(upper.val));
-      r->includeBounds = (upper.inclusive && lower.inclusive);
+      r->includeLowerBound = lower.inclusive;
+      r->includeUpperBound = upper.inclusive;
       return;
     }
 
@@ -1991,6 +2106,12 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeFloat64:
   case TypeFloat64Array: {
     DoubleRestriction *r = (DoubleRestriction *)restriction;
+
+    //not missig swap values
+    double tmp = r->upperBound;
+    r->upperBound = r->lowerBound;
+    r->lowerBound = tmp;
+
     if (qual->typeoid == NUMERICOID) {
       double bound = numericToDouble(DatumGetNumeric(value));
       if (qual->opname[0] == '<')
@@ -1998,11 +2119,12 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       if (qual->opname[0] == '>')
         r->lowerBound = bound;
 
-      r->includeBounds = includeBounds(qual->opname);
+      r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
+      r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
       return;
 
-    } else {                         // range
-      Assert(qual->typeoid == 3906); // this doesnt have a sharp define
+    } else { // range
+      Assert(qual->typeoid == NUMERICRANGEOID); 
       RangeType *range = DatumGetRangeType(value);
 
       Oid rngtypid = RangeTypeGetOid(range);
@@ -2016,12 +2138,12 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
       range_deserialize(typcache, range, &lower, &upper, &empty);
 
-      r->lowerBound = numericToDouble(DatumGetNumeric(lower.val));
-      r->upperBound = numericToDouble(DatumGetNumeric(upper.val));
-      r->includeBounds = (upper.inclusive && lower.inclusive);
+      r->lowerBound = numericToInt64(DatumGetNumeric(lower.val));
+      r->upperBound = numericToInt64(DatumGetNumeric(upper.val));
+      r->includeLowerBound = lower.inclusive;
+      r->includeUpperBound = upper.inclusive;
       return;
-    }
-    // else range
+       }
     break;
   }
 
@@ -2036,8 +2158,9 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       if (enumIdx >= 0) {
         r->include[r->includeCount++] = enumIdx;
       }
+
     } else if (qual->typeoid == TEXTARRAYOID) {
-      ArrayType *strArray = print DatumGetArrayTypeP(value);
+      ArrayType *strArray = DatumGetArrayTypeP(value);
       ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
 
       Datum itrValue;
@@ -2065,13 +2188,38 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       r->includeFalse = (strcmp(qual->opname, "False") == 0);
     }else if(qual->typeoid == 1000){//BOOARRAYOID (no # define)
       //multiple values has to be -> true and false
-      r->includeTrue = r->includeTrue = true;
+      r->includeTrue = true;
+      r->includeFalse = true;
     }
     return;
   }
 
   case TypeString:
   case TypeStringArray: {
+    StringRestriction* r = (StringRestriction*) restriction;
+    if(qual->typeoid == TEXTOID){
+      const char *str = TextDatumGetCString(value);
+      r->match = appendCharStringRestriction(r->match, str, &r->matchSize,
+                                             &r->matchCount);
+
+    }else if(qual->typeoid == TEXTARRAYOID){
+      ArrayType *strArray = DatumGetArrayTypeP(value);
+      ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
+
+      Datum itrValue;
+      bool itrIsNull;
+      while (array_iterate(iterator, &itrValue, &itrIsNull)) {
+        if (itrIsNull) {
+          r->base.includeMissing = true;
+          continue;
+        }
+
+        char *str = TextDatumGetCString(itrValue);
+        r->match = appendCharStringRestriction(r->match, str, &r->matchSize,
+                                             &r->matchCount);
+      }
+    }
+    return;
   }
 
   default: {
@@ -2230,52 +2378,37 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       Assert(restriction->type == RestrictInt);
       IntRestriction *r = (IntRestriction *)restriction;
       int v = v_int32(value);
-      if (r->includeBounds) {
-        if (v < r->lowerBound || v > r->upperBound)
-          return false;
-      } else {
-        if (v <= r->lowerBound || v >= r->upperBound)
-          return false;
-      }
+
+      if ((r->includeLowerBound ? (v < r->lowerBound) : (v <= r->lowerBound)) ||
+          (r->includeUpperBound ? (v > r->upperBound) : (v >= r->upperBound)))
+        return false;
       break;
     }
     case TypeInt64: {
       Assert(restriction->type == RestrictInt64);
       Int64Restriction *r = (Int64Restriction *)restriction;
       int64_t v = v_int64(value);
-      if (r->includeBounds) {
-        if (v < r->lowerBound || v > r->upperBound)
-          return false;
-      } else {
-        if (v <= r->lowerBound || v >= r->upperBound)
-          return false;
-      }
+      if ((r->includeLowerBound ? (v < r->lowerBound) : (v <= r->lowerBound)) ||
+          (r->includeUpperBound ? (v > r->upperBound) : (v >= r->upperBound)))
+        return false;
       break;
     }
     case TypeFloat32: {
       Assert(restriction->type == RestrictDouble);
       DoubleRestriction *r = (DoubleRestriction *)restriction;
       double v = (double)v_float32(value);
-      if (r->includeBounds) {
-        if (v < r->lowerBound || v > r->upperBound)
-          return false;
-      } else {
-        if (v <= r->lowerBound || v >= r->upperBound)
-          return false;
-      }
+      if ((r->includeLowerBound ? (v < r->lowerBound) : (v <= r->lowerBound)) ||
+          (r->includeUpperBound ? (v > r->upperBound) : (v >= r->upperBound)))
+        return false;
       break;
     }
     case TypeFloat64: {
       Assert(restriction->type == RestrictDouble);
       DoubleRestriction *r = (DoubleRestriction *)restriction;
       double v = v_float64(value);
-      if (r->includeBounds) {
-        if (v < r->lowerBound || v > r->upperBound)
-          return false;
-      } else {
-        if (v <= r->lowerBound || v >= r->upperBound)
-          return false;
-      }
+      if ((r->includeLowerBound ? (v < r->lowerBound) : (v <= r->lowerBound)) ||
+          (r->includeUpperBound ? (v > r->upperBound) : (v >= r->upperBound)))
+        return false;
       break;
     }
     case TypeBool: {
@@ -2345,14 +2478,11 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         if (v == INT_MISSING) {
           if (restriction->includeMissing)
             return true;
-        } else {
-          if (r->includeBounds) {
-            if (v >= r->lowerBound && v <= r->upperBound)
-              return true;
-          } else {
-            if (v > r->lowerBound && v < r->upperBound)
-              return true;
-          }
+        } else if ((r->includeLowerBound ? (v >= r->lowerBound)
+                                         : (v > r->lowerBound)) &&
+                   (r->includeUpperBound ? (v <= r->upperBound)
+                    : (v < r->upperBound))){
+          return true;
         }
       }
       return false;
@@ -2366,15 +2496,11 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         if (vf == FLOAT_MISSING) {
           if (restriction->includeMissing)
             return true;
-        } else {
-          double v = (double)vf;
-          if (r->includeBounds) {
-            if (v >= r->lowerBound && v <= r->upperBound)
-              return true;
-          } else {
-            if (v > r->lowerBound && v < r->upperBound)
-              return true;
-          }
+        } else if ((r->includeLowerBound ? (vf >= r->lowerBound)
+                                         : (vf > r->lowerBound)) &&
+                   (r->includeUpperBound ? (vf <= r->upperBound)
+                                         : (vf < r->upperBound))) {
+          return true;
         }
       }
       return false;
@@ -2388,14 +2514,11 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         if (v == DOUBLE_MISSING) {
           if (restriction->includeMissing)
             return true;
-        } else {
-          if (r->includeBounds) {
-            if (v >= r->lowerBound && v <= r->upperBound)
-              return true;
-          } else {
-            if (v > r->lowerBound && v < r->upperBound)
-              return true;
-          }
+        } else if ((r->includeLowerBound ? (v >= r->lowerBound)
+                                         : (v > r->lowerBound)) &&
+                   (r->includeUpperBound ? (v <= r->upperBound)
+                                         : (v < r->upperBound))) {
+          return true;
         }
       }
       return false;

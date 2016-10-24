@@ -22,6 +22,9 @@
 #include "catalog/pg_operator.h"
 #include "mb/pg_wchar.h"
 #include "utils/lsyscache.h"
+#include "utils/rangetypes.h"
+#include "utils/numeric.h"
+#include "fmgr.h"
 #include "parser/parsetree.h"
 
 bool extractClauseFromOpExpr(Relids base_relids, OpExpr *node, List **quals);
@@ -34,7 +37,12 @@ bool extractClauseFromBoolVar(Relids base_relids, Var *node, List **quals, bool 
 
 bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **quals);
 
-bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node, List **quals);
+bool extractClauseBoundedBoolExpr(Relids base_relids, BoolExpr* op, List **quals);
+
+bool extractInvertedBoolExpr(Relids base_relids, BoolExpr *op, List **quals);
+
+bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
+                                       List **quals);
 
 char *getOperatorString(Oid opoid);
 
@@ -138,9 +146,37 @@ Node *unnestClause(Node *node)
       return (Node *)((RelabelType *)node)->arg;
     case T_ArrayCoerceExpr:
       return (Node *)((ArrayCoerceExpr *)node)->arg;
+    case T_FuncExpr:{
+      //  if coerce to numeric ff
+      //  we can disregard this function
+
+      FuncExpr* funcExpr = (FuncExpr*) node;
+
+      //elog(ERROR, "operator string  %s",);
+
+      if(funcExpr->funcid != 1740 /*F_INT4_NUMERIC*/ &&
+         funcExpr->funcid !=  1742/* F_FLOAT4_NUMERIC*/ &&
+         funcExpr->funcid !=  1743/* F_FLOAT8_NUMERIC*/
+         )
+        break;
+      if(funcExpr->funcresulttype != NUMERICOID)
+        break;
+      if(length(funcExpr->args) != 1)
+        break;
+      Expr* arg = list_nth(funcExpr->args, 0); 
+      if(!IsA(arg, Var))
+        break;
+      Var* varArg = (Var*) arg;
+      if(varArg->vartype != INT4OID &&
+         varArg->vartype != FLOAT4OID &&
+         varArg->vartype != FLOAT8OID)
+        break;
+      return (Node*) varArg;
+    }
     default:
       return node;
   }
+  return node;
 }
 
 void swapOperandsAsNeeded(Node **left, Node **right, Oid *opoid, Relids base_relids)
@@ -192,15 +228,20 @@ OpExpr *canonicalOpExpr(OpExpr *opExpr, Relids base_relids)
   OpExpr *result = NULL;
 
   /* Only treat binary operators for now. */
-  if (list_length(opExpr->args) == 2) {
-    l = unnestClause(list_nth(opExpr->args, 0));
-    r = unnestClause(list_nth(opExpr->args, 1));
-    swapOperandsAsNeeded(&l, &r, &operatorid, base_relids);
-    if (IsA(l, Var) && bms_is_member(((Var *)l)->varno, base_relids) && ((Var *)l)->varattno >= 1) {
-      result = (OpExpr *)make_opclause(operatorid, opExpr->opresulttype, opExpr->opretset,
-                                       (Expr *)l, (Expr *)r, opExpr->opcollid, opExpr->inputcollid);
-    }
+  if (list_length(opExpr->args) != 2)
+    return result;
+
+  l = unnestClause(list_nth(opExpr->args, 0));
+  r = unnestClause(list_nth(opExpr->args, 1));
+  swapOperandsAsNeeded(&l, &r, &operatorid, base_relids);
+  
+  if (IsA(l, Var) &&
+      bms_is_member(((Var *)l)->varno, base_relids) &&
+      ((Var *)l)->varattno >= 1) {
+    result = (OpExpr *)make_opclause(operatorid, opExpr->opresulttype, opExpr->opretset,
+                                     (Expr *)l, (Expr *)r, opExpr->opcollid, opExpr->inputcollid);
   }
+
   return result;
 }
 
@@ -250,7 +291,7 @@ ScalarArrayOpExpr *canonicalScalarArrayOpExpr(ScalarArrayOpExpr *opExpr, Relids 
  */
 void extractRestrictions(Relids base_relids, Expr *node, List **quals)
 {
-  //elog(WARNING, "extractRestrictions: - %s",nodeToString(node));
+  elog(WARNING, "extractRestrictions: - %s",nodeToString(node));
   switch (nodeTag(node)) {
 
     case T_OpExpr:
@@ -269,11 +310,18 @@ void extractRestrictions(Relids base_relids, Expr *node, List **quals)
       break;
 
     case T_BoolExpr:
+      if(extractInvertedBoolExpr(base_relids, (BoolExpr *)node, quals))
+        return;
+
       if (extractClauseBoolVarFromBoolExpr(base_relids, (BoolExpr *)node, quals))
         return;
 
       if(extractClauseWithNullFromBoolExpr(base_relids, (BoolExpr *)node, quals))
          return;
+
+      if (extractClauseBoundedBoolExpr(base_relids, (BoolExpr *)node, quals))
+        return;
+
       break;
 
     case T_Var:
@@ -306,6 +354,7 @@ bool extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
 
   /* Use a "canonical" version of the op expression, to ensure that the */
   /* left operand is a Var on our relation. */
+  //elog(WARNING, "opex: %s",getOperatorString(op->opno));
   op = canonicalOpExpr(op, base_relids);
   if (!op)
     return false;
@@ -316,10 +365,12 @@ bool extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
   /* Do not add it if it either contains a mutable function, or makes */
   /* self references in the right hand side. */
   if (contain_volatile_functions((Node *)right))
-    return true;
+    return false;
+
 
   if (bms_is_subset(base_relids, pull_varnos((Node *)right)))
-    return true;
+    return false;
+
 
   *quals = lappend(*quals, makeQual(left->varattno, getOperatorString(op->opno),
                                     right, false, /*use or*/ false,
@@ -347,9 +398,9 @@ bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *o
   if (bms_is_subset(base_relids, pull_varnos((Node *)right)))
     return false;
 
-  *quals = lappend(*quals,
-                   makeQual(left->varattno, getOperatorString(op->opno), right,
-                            true, op->useOr, /*include missing*/ false));
+  *quals = lappend(*quals, makeQual(left->varattno, getOperatorString(op->opno),
+                                    right, true, op->useOr,
+                                    /*include missing*/ false));
 
   return true;
 }
@@ -360,7 +411,7 @@ bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *o
  */
 bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
 {
-  MulticornBaseQual *result;
+  MulticornBaseQual *result = NULL;
   char *opname = NULL;
 
   if (node->nulltesttype == IS_NULL) {
@@ -391,7 +442,7 @@ bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
       return false;
 
     result = makeQual(left->varattno, opname,
-                      (Expr *)makeNullConst(INT4OID, -1, InvalidOid), false,
+                      (Expr *)makeNullConst(left->vartype, -1, InvalidOid), false,
                       /*use or*/ false,
                       /*include missing*/ node->nulltesttype == IS_NULL);
 
@@ -403,12 +454,15 @@ bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
       return false;
 
     result = makeQual(var->varattno, opname,
-                      (Expr *)makeNullConst(INT4OID, -1, InvalidOid), false,
+                      (Expr *)makeNullConst(var->vartype, -1, InvalidOid), false,
                       /*use or*/ false,
                       /*include missing*/ node->nulltesttype == IS_NULL);
   }
-  *quals = lappend(*quals, result);
 
+  if(!result)
+    return false;
+
+  *quals = lappend(*quals, result);
   return true;
 }
 
@@ -427,9 +481,9 @@ bool extractClauseFromBoolVar(Relids base_relids, Var *varNode, List **quals, bo
   else
     opname = "False";
 
-  *quals = lappend(*quals,
-                  makeQual(varNode->varattno, opname, (Expr*)varNode, /* is array*/ false,
-                           /*useOr*/ false, /*includeMissing*/ false));
+  *quals = lappend(*quals, makeQual(varNode->varattno, opname, (Expr *)varNode,
+                                    /* is array*/ false,
+                                    /*useOr*/ false, /*includeMissing*/ false));
   return true;
 }
 
@@ -450,6 +504,88 @@ bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **q
 
   return extractClauseFromBoolVar(base_relids, (Var *)arg, quals,
                                   /*not this*/ false);
+}
+
+/*
+ * Check for bounded expressions
+ * i.e.  intfield BETWEEN 8.0 and 12.0
+ */
+
+bool extractClauseBoundedBoolExpr(Relids base_relids, BoolExpr* op, List **quals)
+{
+  if(op->boolop != AND_EXPR)
+    return false;
+
+  if(list_length(op->args) != 2) //lower and upper bound
+    return false;
+
+  Expr *lowerExpr = list_nth(op->args, 0);
+  Expr *upperExpr = list_nth(op->args, 1);
+
+  if (!IsA(lowerExpr, OpExpr) || !IsA(upperExpr, OpExpr))
+    return false;
+
+  List* lowerList = NIL;
+  List *upperList = NIL;
+
+  if (!extractClauseFromOpExpr(base_relids, (OpExpr *)lowerExpr, &lowerList) ||
+      !extractClauseFromOpExpr(base_relids, (OpExpr *)upperExpr, &upperList))
+    return false;
+
+  if (length(lowerList) != 1 || length(upperList) != 1)
+    return false;
+
+  // now extract the quals from the list and collapse them in a sinlge qual with
+  // a bound
+
+  MulticornBaseQual *lowerQual = (MulticornBaseQual *)list_nth(op->args, 0);
+  MulticornBaseQual *upperQual = (MulticornBaseQual *)list_nth(op->args, 1);
+
+  if (lowerQual->right_type != T_Const || upperQual->right_type != T_Const ||
+      ((MulticornConstQual *)lowerQual)->isnull ||
+      ((MulticornConstQual *)upperQual)->isnull ||
+      (upperQual->varattno != upperQual->varattno) ||
+      lowerQual->typeoid != NUMERICOID || upperQual->typeoid != NUMERICOID)
+    return false;
+
+  Datum lowerDatum = ((MulticornConstQual *)lowerQual)->value;
+  Datum upperDatum = ((MulticornConstQual *)upperQual)->value;
+
+  Oid rngtypid = 3906;
+  TypeCacheEntry *typcache = lookup_type_cache(rngtypid, TYPECACHE_RANGE_INFO);
+  if (typcache->rngelemtype == NULL)
+    return false;
+
+  bool empty = false;
+  RangeBound upper, lower;
+
+  if (DatumGetBool(DirectFunctionCall2(numeric_lt, lowerDatum, upperDatum))) {
+    lower.val = NumericGetDatum(DatumGetNumericCopy(lowerDatum));
+    upper.val = NumericGetDatum(DatumGetNumericCopy(upperDatum));
+
+    lower.inclusive = strstr(lowerQual->opname, "=") == 0;
+    upper.inclusive = strstr(upperQual->opname, "=") == 0;
+
+  } else {
+    upper.val = NumericGetDatum(DatumGetNumericCopy(lowerDatum));
+    lower.val = NumericGetDatum(DatumGetNumericCopy(upperDatum));
+
+    upper.inclusive = strstr(lowerQual->opname, "=") == 0;
+    lower.inclusive = strstr(upperQual->opname, "=") == 0;
+  }
+
+  RangeType *range = make_range(typcache, &lower,&upper, empty);
+
+  MulticornBaseQual *qual =
+      makeQual(upperQual->varattno, "contains",
+               (Expr *)makeConst(RangeTypeGetOid(range), /*consttypemod*/ -1,
+                                 /*constcollid*/ -1,
+                                 /*constlen*/ -1, RangeTypeGetDatum(range),
+                                 /*isnull*/ false, /*constbyval*/ false),
+               /*isarray*/ false, /*userOr*/ false, /*include missing*/ false);
+
+  *quals = lappend(*quals, qual);
+  return true;
 }
 
 /*
@@ -490,7 +626,11 @@ bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
       break;
 
     case T_BoolExpr:
-      if (!extractClauseBoolVarFromBoolExpr(base_relids, (BoolExpr *)subNode, &exprList))
+      if (!extractClauseBoolVarFromBoolExpr(base_relids, (BoolExpr *)subNode,
+                                            &exprList) &&
+          !extractClauseBoundedBoolExpr(base_relids, (BoolExpr *)subNode,
+                                        &exprList))
+
         return false;
     // this happens with sample filters -> may need to revisit
     // there is a nested 'sample is not null' and 'sample value is not null'
@@ -515,6 +655,35 @@ bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
 
   return true;
 }
+
+/*
+ * Extract inverted from bool expr
+ */ 
+bool extractInvertedBoolExpr(Relids base_relids, BoolExpr *op,
+                                      List **quals)
+{
+  if (op->boolop != NOT_EXPR)
+    return false;
+
+  if (list_length(op->args) != 1)
+    return false;
+
+  Expr *arg = (Expr *)list_nth(op->args, 0);
+
+  List* extracted = NIL;
+  extractRestrictions(base_relids, arg, &extracted);
+
+  if(length(extracted) != 1)
+    return false;
+
+  MulticornBaseQual* qual = list_nth(extracted, 0);
+  qual->inverted = true;
+
+  elog(INFO, "restriction inverted");
+  *quals = lappend(*quals, qual);
+  return true;
+}
+
 /*
  *	Returns a "Value" node containing the string name of the column from a var.
  */
@@ -537,7 +706,7 @@ MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value,
                             bool isarray, bool useOr, bool includeMissing) {
   MulticornBaseQual *qual;
 
-  elog(INFO, "make qual expr: %s", nodeToString(value));
+  //elog(INFO, "make qual expr: %s", nodeToString(value));
   switch (value->type) {
     case T_Const:
       qual = palloc0(sizeof(MulticornConstQual));
@@ -564,6 +733,7 @@ MulticornBaseQual *makeQual(AttrNumber varattno, char *opname, Expr *value,
   qual->isArray = isarray;
   qual->useOr = useOr;
   qual->includeMissing = includeMissing;
+  qual->inverted = false;
   return qual;
 }
 
@@ -599,8 +769,9 @@ void collapseNullQuals(List **quals)
         continue;
 
       // else we can colapse this null check into the is missing of current qual
-      elog(INFO, "collapsed null test node. Include missing %d", qual->includeMissing);
-      current->includeMissing = qual->includeMissing;
+      elog(INFO, "collapsed null test node. Include missing %d %d",
+           qual->includeMissing, qual->inverted);
+      current->includeMissing = (qual->includeMissing != qual->inverted);
       trimmedList = list_delete_ptr(trimmedList, qual);
       break;
     }

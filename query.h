@@ -65,6 +65,7 @@ typedef struct MulticornBaseQual {
   bool isArray;
   bool useOr; // ANY on array operators
   bool includeMissing;
+  bool inverted;
 } MulticornBaseQual;
 
 typedef struct MulticornConstQual {

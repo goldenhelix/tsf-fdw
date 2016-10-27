@@ -177,6 +177,7 @@ typedef struct EnumRestriction {
   RestrictionBase base;
   int includeCount;
   int *include;  // Enum indexes to include
+  bool doesNotMatch;
 } EnumRestriction;
 
 typedef struct BoolRestriction {
@@ -2268,6 +2269,7 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       return;
     EnumRestriction *r = (EnumRestriction *)restriction;
     r->includeCount = 0;
+    r->doesNotMatch == (strcmp(qual->opname, "<>") == 0);
 
     if (qual->typeoid == TEXTOID) {
       const char *str = TextDatumGetCString(value);
@@ -2559,7 +2561,7 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       bool matchOne = false;
       // r->include is list of acceptible indexes
       for (int j = 0; j < r->includeCount; j++) {
-        if (idx == r->include[j]) {
+        if ((idx == r->include[j]) == r->doesNotMatch) {
           matchOne = true;
           break;
         }
@@ -2696,7 +2698,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         } else {
           // r->include is list of acceptible indexes
           for (int j = 0; j < r->includeCount; j++) {
-            if (idx == r->include[j])
+            if ((idx == r->include[j]) != r->doesNotMatch)
               return !r->base.inverted;
           }
         }

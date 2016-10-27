@@ -1090,8 +1090,39 @@ static void TsfExplainForeignScan(ForeignScanState *scanState, ExplainState *exp
   }
 }
 
-static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
-{
+static char *appendCharStringRestriction(char *old, const char *append, Size *size,
+                                         int *count) {
+  Size oldSize = *size;
+  *size = sizeof(char) * (oldSize + strlen(append) + 1 /* for null */);
+
+  char* out = NULL;
+  if(!old || oldSize == 0){
+    old = NULL;
+    out = (char*) palloc(*size);
+  }else{
+    out = repalloc(old, *size);
+  }
+
+  if (!out) {
+    ereport(WARNING, (errmsg("Can not compare strings"),
+                      errdetail("Could not allocate additional string comparison value")));
+    *size = oldSize;
+    return old;
+  }
+
+  char * appendLoc = out; 
+  if(old){
+    strncpy(appendLoc, old, oldSize);
+    appendLoc = (&appendLoc[oldSize])+ 1 /* skip null char */;
+  }
+
+  *count = *count + 1;
+  strncpy(appendLoc, append, strlen(append) + 1);
+  return out;
+}
+
+static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field,
+                                         MulticornBaseQual *qual) {
   switch (field->value_type) {
 
   case TypeInt32:
@@ -1152,13 +1183,38 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field)
 
   case TypeString:
   case TypeStringArray: {
+    Assert(qual->right_type == T_Const);
     StringRestriction *r = palloc0(sizeof(StringRestriction));
     r->base.col = col;
     r->base.type = RestrictString;
     r->doesNotMatch = false;
     r->matchCount = 0;
     r->matchSize = 0;
-    r->match = ""; //null string
+
+    //need to alloc our string here because it has variable size
+    if (qual->typeoid == TEXTOID) {
+      const char *str = TextDatumGetCString(((MulticornConstQual*)qual)->value);
+      r->match = appendCharStringRestriction(r->match, str, &r->matchSize,
+                                             &r->matchCount);
+
+    } else if (qual->typeoid == TEXTARRAYOID) {
+      ArrayType *strArray = DatumGetArrayTypeP(((MulticornConstQual*)qual)->value);
+      ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
+
+      Datum itrValue;
+      bool itrIsNull;
+      while (array_iterate(iterator, &itrValue, &itrIsNull)) {
+        if (itrIsNull) {
+          r->base.includeMissing = true;
+          continue;
+        }
+
+        char *str = TextDatumGetCString(itrValue);
+        r->match = appendCharStringRestriction(r->match, str, &r->matchSize,
+                                               &r->matchCount);
+      }
+    }
+
     return (RestrictionBase *)r;
   }
 
@@ -1199,7 +1255,7 @@ static void buildColumnRestrictions(TsfFdwExecState *state) {
         &sourceState->tsf->sources[sourceState->sourceId - 1];
 
     tsf_field *field = &tsfSource->fields[col->fieldIdx];
-    RestrictionBase *restriction = buildRestriction(col, field);
+    RestrictionBase *restriction = buildRestriction(col, field, qual);
     // Add to to state
     state->columnRestrictions[state->restrictionCount++] = restriction;
     elog(INFO, "added restriction [%d] %p", state->restrictionCount, restriction);
@@ -2025,37 +2081,6 @@ static double numericToDouble(Numeric num)
   return strtod(valStr, NULL);
 }
 
-static char *appendCharStringRestriction(char *old, const char *append, Size *size,
-                                         int *count) {
-  Size oldSize = *size;
-  *size = sizeof(char*) * (oldSize + strlen(append) + 1 /* for null */);
-
-  char* out = NULL;
-  if(!old || oldSize == 0){
-    old = NULL;
-    out = (char*) palloc(*size);
-  }else{
-    out = repalloc(old, *size);
-  }
-
-  if (!out) {
-    ereport(WARNING, (errmsg("Can not compare strings"),
-                      errdetail("Could not allocate additional string comparison value")));
-    *size = oldSize;
-    return old;
-  }
-
-  char * appendLoc = out; 
-  if(old){
-    strncpy(appendLoc, old, oldSize);
-    appendLoc = (&appendLoc[oldSize])+ 1 /* skip null char */;
-  }
-
-  *count = *count + 1;
-  strncpy(appendLoc, append, strlen(append) + 1);
-  return out;
-}
-
 static bool notEqual(char* opName)
 {
   if(strcmp("<>", opName) == 0)
@@ -2322,28 +2347,9 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
     if (isNull)
       return;
 
-    if(qual->typeoid == TEXTOID){
-      const char *str = TextDatumGetCString(value);
-      r->match = appendCharStringRestriction(r->match, str, &r->matchSize,
-                                             &r->matchCount);
-
-    }else if(qual->typeoid == TEXTARRAYOID){
-      ArrayType *strArray = DatumGetArrayTypeP(value);
-      ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
-
-      Datum itrValue;
-      bool itrIsNull;
-      while (array_iterate(iterator, &itrValue, &itrIsNull)) {
-        if (itrIsNull) {
-          r->base.includeMissing = true;
-          continue;
-        }
-
-        char *str = TextDatumGetCString(itrValue);
-        r->match = appendCharStringRestriction(r->match, str, &r->matchSize,
-                                             &r->matchCount);
-      }
-    }
+    // value was bound on creation as only right side const values are
+    // internable for strings, as only const values are available from the start
+    // and we need to alloc the compared string when the restriction is created.
     return;
   }
 

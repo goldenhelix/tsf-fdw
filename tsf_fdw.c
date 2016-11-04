@@ -974,7 +974,7 @@ static void TsfGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid forei
  * query.
  */
 static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
-                                      ForeignPath *bestPath, List *targetList, List *scanClauses
+                                      ForeignPath *bestPath, List *targetList, List *scan_clauses
 #if PG_VERSION_NUM >= 90500
                                       ,Plan *outer_plan
 #endif
@@ -992,7 +992,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
    */
   ListCell *lc = NULL;
   bool foundIdRestriction = false;
-  foreach (lc, scanClauses) {
+  foreach (lc, scan_clauses) {
     RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
 
     Assert(IsA(rinfo, RestrictInfo));
@@ -1011,13 +1011,13 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
       // are found. Otherwise we can have any number of internalizable
       // restriction expressions.
       if (isIdRestriction(foreignTableId, qual)) {
-        //ListCell *tsflc;//put the other internable restrictions back 
-        //      foreach (tsflc, tsfExprs) {
-        //localExprs = lappend(localExprs, lfirst(tsflc));
-        //}
-        //      tsfExprs = NIL;
+        ListCell *tsflc;//put the other internable restrictions back 
+             foreach (tsflc, tsfExprs) {
+        localExprs = lappend(localExprs, lfirst(tsflc));
+        }
+              tsfExprs = NIL;
         tsfExprs = lappend(tsfExprs, rinfo->clause);
-        //foundIdRestriction = false; //true;
+        foundIdRestriction = false; //true;
 
       } else if (isEntityIdRestriction(foreignTableId, qual)) {
         entityClauses = lappend(entityClauses, rinfo->clause);

@@ -80,9 +80,9 @@
 
 #ifndef NUMERICRANGEOID
 #define NUMERICRANGEOID 3906
-#endif 
+#endif
 
-//#define REPORT_ITER_STATS 1
+#define REPORT_ITER_STATS 1
 
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
@@ -984,14 +984,12 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
   Index scanRangeTableIndex = baserel->relid;
   List *localExprs = NIL;
   List *tsfExprs = NIL;
-  List *entityClauses = NIL;
 
   /*
    * Separate the scan_clauses into those that can be executed
    * internally and those that can't.
    */
   ListCell *lc = NULL;
-  bool foundIdRestriction = false;
   foreach (lc, scan_clauses) {
     RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
 
@@ -1010,24 +1008,15 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
       // ID restrictions must be only internalized expressions if they
       // are found. Otherwise we can have any number of internalizable
       // restriction expressions.
-      if (isIdRestriction(foreignTableId, qual)) {
-        ListCell *tsflc;//put the other internable restrictions back 
-             foreach (tsflc, tsfExprs) {
-        localExprs = lappend(localExprs, lfirst(tsflc));
-        }
-              tsfExprs = NIL;
+      if (isIdRestriction(foreignTableId, qual) ||
+          isEntityIdRestriction(foreignTableId, qual)) {
         tsfExprs = lappend(tsfExprs, rinfo->clause);
-        foundIdRestriction = false; //true;
 
-      } else if (isEntityIdRestriction(foreignTableId, qual)) {
-        entityClauses = lappend(entityClauses, rinfo->clause);
-
-      } else if (!foundIdRestriction &&
-                 isInternableRestriction(foreignTableId, qual)) {
-        //elog(INFO, "restriction is internable");
+      } else if (isInternableRestriction(foreignTableId, qual)) {
         tsfExprs = lappend(tsfExprs, rinfo->clause);
+
       } else {
-        localExprs = lappend(localExprs, rinfo->clause);  // We don't hanle
+        localExprs = lappend(localExprs, rinfo->clause); // We don't hanle
       }
     } else {
       // Wasn't able to extract these restrictions...
@@ -1035,11 +1024,8 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
     }
   }
 
-  foreach(lc, entityClauses){
-    tsfExprs = lappend(tsfExprs, lfirst(lc));
-  }
-  // elog(INFO, "[%f] extracted %d TSF, %d local quals", baserel->rows, list_length(tsfExprs),
-  // list_length(localExprs));
+  //elog(INFO, "[%f] extracted %d TSF, %d local quals", baserel->rows,
+  //     list_length(tsfExprs), list_length(localExprs));
   /*
    * As an optimization, we only read columns that are present in the
    * query.  We already extracted those columns and placed them in
@@ -1259,7 +1245,7 @@ static void buildColumnRestrictions(TsfFdwExecState *state) {
     RestrictionBase *restriction = buildRestriction(col, field, qual);
     // Add to to state
     state->columnRestrictions[state->restrictionCount++] = restriction;
-    elog(INFO, "added restriction [%d] %p", state->restrictionCount, restriction);
+    //elog(INFO, "added restriction [%d] %p", state->restrictionCount, restriction);
   }
 }
 
@@ -1325,9 +1311,9 @@ static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 
   buildColumnRestrictions(executionState);
 
-  elog(INFO, "%s[%d], cols %d quals %d", __func__,
-       tsfFdwOptions->fieldType, list_length(columnList),
-       list_length(executionState->qualList));
+  //elog(INFO, "%s[%d], cols %d quals %d", __func__,
+  //       tsfFdwOptions->fieldType, list_length(columnList),
+  //       list_length(executionState->qualList));
 
   scanState->fdw_state = (void *)executionState;
 }
@@ -1388,40 +1374,10 @@ static TupleTableSlot *TsfIterateForeignScan(ForeignScanState *scanState)
     initQuery(state);
   }
 
-  if (state->idList) {
-    // Special iteration if we are doing ID lookups
-    if (state->iter->cur_entity_idx >= 0 &&
-        state->iter->cur_entity_idx + 1 < state->iter->entity_count) {
-      // If there are more entities to scan for the current ID, use iter_next to scan those
-      //elog(NOTICE, "next _id: %d _entity_id: %d", state->idList[state->idListIdx], state->iter->cur_entity_idx);
-
-      if (tsf_iter_next(state->iter)) {
-        fillTupleSlot(state, columnValues, columnNulls);
-        ExecStoreVirtualTuple(tupleSlot);
-      }
-    } else {
-      state->idListIdx++;
-      if (state->idListIdx < state->idListCount) {
-        if (tsf_iter_id(state->iter, state->idList[state->idListIdx])) {
-          fillTupleSlot(state, columnValues, columnNulls);
-          ExecStoreVirtualTuple(tupleSlot);
-        }
-      }
-    }
-  } else {
-    // Debug output first and last iteration to see if tables are doing full table scans
-    // if(state->iter->cur_record_id < 0 || state->iter->cur_record_id >= state->iter->max_record_id
-    // - 1) elog(INFO, "[%d][%d] iterscan: %d [%d of %d]", state->sourceId, state->fieldType,
-    // state->iter->cur_record_id, state->iter->cur_entity_idx, state->iter->entity_count);
-
-    if (iterateWithRestrictions(state)) {
-      fillTupleSlot(state, columnValues, columnNulls);
-      ExecStoreVirtualTuple(tupleSlot);
-    }
+  if (iterateWithRestrictions(state)) {
+    fillTupleSlot(state, columnValues, columnNulls);
+    ExecStoreVirtualTuple(tupleSlot);
   }
-
-  // Note if not iter succeeded, then the cleared slot is a sentinal to
-  // stop iteration.
 
   return tupleSlot;
 }
@@ -1436,8 +1392,8 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
 
   /* if we executed a query, reclaim tsf related resources */
   if (state != NULL) {
-    // elog(INFO, "entering function %s[%d][%d] %p %p", __func__, state->sourceId, state->fieldType,
-    // state, state->iter);
+    //elog(INFO, "entering function %s[%d] %p %p", __func__, state->fieldType,
+    //     state, state->iter);
     tsf_iter_close(state->iter);
 
     for (int i = 0; i < state->columnCount; i++) {
@@ -1869,8 +1825,8 @@ static bool textCompareOperator(const char* optString)
 
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
-  //elog(WARNING, "isInternableRestriction::oid type %d",
-  //     get_atttype(foreignTableId, qual->varattno));
+//  elog(WARNING, "isInternableRestriction::oid type %d",
+//       get_atttype(foreignTableId, qual->varattno));
 
   int attType = get_atttype(foreignTableId, qual->varattno);
 
@@ -2732,10 +2688,33 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
   return true; //presumed un-reachable
 }
 
+bool iterateRecord(TsfFdwExecState *state) {
+  if (!state->idList)
+    return tsf_iter_next(state->iter);
+
+  // Special iteration if we are doing ID lookups
+  if (state->iter->cur_entity_idx >= 0 &&
+      state->iter->cur_entity_idx + 1 < state->iter->entity_count) {
+    // If there are more entities to scan for the current ID, use iter_next to
+    // scan those
+    // elog(NOTICE, "next _id: %d _entity_id: %d",
+    // state->idList[state->idListIdx], state->iter->cur_entity_idx);
+    return tsf_iter_next(state->iter);
+
+  } else {
+    state->idListIdx++;
+
+    if (state->idListIdx < state->idListCount)
+      return tsf_iter_id(state->iter, state->idList[state->idListIdx]);
+
+  }
+  return false;
+}
+
 static bool iterateWithRestrictions(TsfFdwExecState *state) {
   // Advanced our master iterator along until all of our restricitons are satisifed or it reaches
   // the end. Returns false when at end-of-table.
-  while (tsf_iter_next(state->iter)) {
+  while (iterateRecord(state)) {
     bool allRestrictionsSatisifed = true;
     for (int restIdx = 0; restIdx < state->restrictionCount; restIdx++) {
       RestrictionBase* restriction = state->columnRestrictions[restIdx];

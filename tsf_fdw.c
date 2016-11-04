@@ -2714,9 +2714,14 @@ bool iterateRecord(TsfFdwExecState *state) {
 static bool iterateWithRestrictions(TsfFdwExecState *state) {
   // Advanced our master iterator along until all of our restricitons are satisifed or it reaches
   // the end. Returns false when at end-of-table.
-  while (iterateRecord(state)) {
-    bool allRestrictionsSatisifed = true;
+
+  bool allRestrictionsSatisifed = false;
+  while (iterateRecord(state) && !allRestrictionsSatisifed) {
+    allRestrictionsSatisifed = true;
     for (int restIdx = 0; restIdx < state->restrictionCount; restIdx++) {
+          if (allRestrictionsSatisifed)
+      return true;
+
       RestrictionBase* restriction = state->columnRestrictions[restIdx];
       ColumnMapping *col = restriction->col;
       tsf_field *f = col->iter->fields[0];
@@ -2829,11 +2834,15 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
         }
       }
     }
-    if (allRestrictionsSatisifed)
-      return true;
     // Otherwise loop and eval next record
   }
-  return false;  // End of table
+
+  // if filtering on an entity list we short circuit evalution and set the
+  // current entity past the last one
+  if (state->iter->cur_entity_idx >= 0 && state->restrictionCount > 0)
+    state->iter->cur_entity_idx = state->iter->entity_count;
+
+  return allRestrictionsSatisifed;
 }
 
 // We need a sentinal for a missing value other than NULL, which is a

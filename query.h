@@ -85,7 +85,7 @@ typedef struct MulticornParamQual {
 } MulticornParamQual;
 
 /* query.c */
-void extractRestrictions(Relids base_relids, Expr *node, List **quals);
+void extractRestrictions(Oid foreignTableId, Relids base_relids, Expr *node, List **quals);
 void collapseNullQuals(List **quals);
 List *extractColumns(List *reltargetlist, List *restrictinfolist);
 void initConversioninfo(ConversionInfo **cinfo, AttInMetadata *attinmeta);

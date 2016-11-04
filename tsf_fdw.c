@@ -192,6 +192,7 @@ typedef struct StringRestriction {
   Size matchSize;
   char *match;  // Exact match
   bool doesNotMatch;
+  int (*strcmpfn)(const char*,const char*);
 } StringRestriction;
 
 
@@ -1001,7 +1002,7 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
       continue;
 
     List *quals = NIL;
-    extractRestrictions(baserel->relids, rinfo->clause, &quals);
+    extractRestrictions(foreignTableId, baserel->relids, rinfo->clause, &quals);
 
     //elog(WARNING, "restrictions extracted: %d", list_length(quals));
     if (list_length(quals) == 1) {
@@ -1314,7 +1315,7 @@ static void TsfBeginForeignScan(ForeignScanState *scanState, int executorFlags)
   List *foreignExprs = foreignScan->fdw_exprs;
   ListCell *lc = NULL;
   foreach (lc, foreignExprs) {
-    extractRestrictions(bms_make_singleton(foreignScan->scan.scanrelid),
+    extractRestrictions(foreignTableId, bms_make_singleton(foreignScan->scan.scanrelid),
                         ((Expr *)lfirst(lc)),
                         &executionState->qualList);
   }
@@ -1802,7 +1803,7 @@ static bool isIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 static bool isEntityIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
   char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
-  if (stricmp(columnName, "_entity_id") == 0 && (strcmp(qual->opname, "=") == 0 || strcmp(qual->opname, "<>") == 0)) {
+  if (stricmp(columnName, "_entity_id") == 0 && (strcmp(qual->opname, "=") == 0)) {
     // Scalar or useOr
     return !qual->isArray || qual->useOr;
   }
@@ -1856,6 +1857,10 @@ static bool textCompareOperator(const char* optString)
   if (strcmp(optString, "<>") == 0)
     return true;
   if (strcmp(optString, "!=") == 0)
+    return true;
+
+  //string icompare
+  if (strcmp(optString, "~~*") == 0)
     return true;
 
   return false;
@@ -1982,7 +1987,7 @@ static bool isParamatizable(Oid foreignTableId, RelOptInfo *baserel, Expr *expr,
                             bool *outIsEntityIdRestriction)
 {
   List *quals = NIL;
-  extractRestrictions(baserel->relids, expr, &quals);
+  extractRestrictions(foreignTableId, baserel->relids, expr, &quals);
 
   if (list_length(quals) == 1) {
     MulticornBaseQual *qual = (MulticornBaseQual *)linitial(quals);
@@ -2347,6 +2352,12 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
     if (isNull)
       return;
 
+    if(strcmp(qual->opname, "~~*") == 0){
+      r->strcmpfn = &stricmp;
+    }else{
+      r->strcmpfn = &strcmp;
+    }
+
     // value was bound on creation as only right side const values are
     // internable for strings, as only const values are available from the start
     // and we need to alloc the compared string when the restriction is created.
@@ -2554,7 +2565,7 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       Assert(restriction->type == RestrictString);
       StringRestriction *r = (StringRestriction *)restriction;
       const char *s = v_str(value);
-      bool match = strcmp(s, r->match) == 0;
+      bool match = r->strcmpfn(s, r->match) == 0;
       if(r->doesNotMatch == match) // this works, think about it...
         return r->base.inverted;
       break;
@@ -2681,7 +2692,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
           if (restriction->includeMissing != r->base.inverted)
             return !r->base.inverted;
         } else {
-          bool match = strcmp(s, r->match) == 0;
+          bool match = r->strcmpfn(s, r->match) == 0;
           if(r->doesNotMatch != match)
             return !r->base.inverted;
         }

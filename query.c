@@ -27,22 +27,26 @@
 #include "fmgr.h"
 #include "parser/parsetree.h"
 
-bool extractClauseFromOpExpr(Relids base_relids, OpExpr *node, List **quals);
+bool extractClauseFromOpExpr(Oid foreignTableId, Relids base_relids, OpExpr *node, List **quals);
 
-bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals);
+bool extractClauseFromNullTest(Oid foreignTableId, Relids base_relids, NullTest *node, List **quals);
 
-bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *node, List **quals);
+bool extractClauseFromScalarArrayOpExpr(Oid foreignTableId, Relids base_relids, ScalarArrayOpExpr *node, List **quals);
 
-bool extractClauseFromBoolVar(Relids base_relids, Var *node, List **quals, bool value);
+bool extractClauseFromBoolVar(Oid foreignTableId, Relids base_relids, Var *node, List **quals, bool value);
 
-bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **quals);
+bool extractClauseBoolVarFromBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr* op, List **quals);
 
-bool extractClauseBoundedBoolExpr(Relids base_relids, BoolExpr* op, List **quals);
+bool extractClauseBoundedBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr* op, List **quals);
 
-bool extractInvertedBoolExpr(Relids base_relids, BoolExpr *op, List **quals);
+bool extractInvertedBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr *op, List **quals);
 
-bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
+bool extractClauseNullSampleBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr *node,
+                                     List **quals);
+
+bool extractClauseWithNullFromBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr *node,
                                        List **quals);
+
 
 char *getOperatorString(Oid opoid);
 
@@ -289,43 +293,43 @@ ScalarArrayOpExpr *canonicalScalarArrayOpExpr(ScalarArrayOpExpr *opExpr, Relids 
  * Extract conditions that can be pushed down, as well as the parameters.
  *
  */
-void extractRestrictions(Relids base_relids, Expr *node, List **quals)
+void extractRestrictions(Oid foreignTableId, Relids base_relids, Expr *node, List **quals)
 {
   //elog(WARNING, "extractRestrictions: - %s",nodeToString(node));
   switch (nodeTag(node)) {
 
     case T_OpExpr:
-      if(extractClauseFromOpExpr(base_relids, (OpExpr *)node, quals))
+      if(extractClauseFromOpExpr(foreignTableId, base_relids, (OpExpr *)node, quals))
         return;
       break;
 
     case T_NullTest:
-      if(extractClauseFromNullTest(base_relids, (NullTest *)node, quals))
+      if(extractClauseFromNullTest(foreignTableId, base_relids, (NullTest *)node, quals))
         return;
       break;
 
     case T_ScalarArrayOpExpr:
-      if(extractClauseFromScalarArrayOpExpr(base_relids, (ScalarArrayOpExpr *)node, quals))
+      if(extractClauseFromScalarArrayOpExpr(foreignTableId, base_relids, (ScalarArrayOpExpr *)node, quals))
         return;
       break;
 
     case T_BoolExpr:
-      if(extractInvertedBoolExpr(base_relids, (BoolExpr *)node, quals))
+      if(extractInvertedBoolExpr(foreignTableId, base_relids, (BoolExpr *)node, quals))
         return;
 
-      if (extractClauseBoolVarFromBoolExpr(base_relids, (BoolExpr *)node, quals))
+      if (extractClauseBoolVarFromBoolExpr(foreignTableId, base_relids, (BoolExpr *)node, quals))
         return;
 
-      if(extractClauseWithNullFromBoolExpr(base_relids, (BoolExpr *)node, quals))
+      if(extractClauseWithNullFromBoolExpr(foreignTableId, base_relids, (BoolExpr *)node, quals))
          return;
 
-      if (extractClauseBoundedBoolExpr(base_relids, (BoolExpr *)node, quals))
+      if (extractClauseBoundedBoolExpr(foreignTableId, base_relids, (BoolExpr *)node, quals))
         return;
 
       break;
 
     case T_Var:
-      if(extractClauseFromBoolVar(base_relids, (Var*) node, quals, true))
+      if(extractClauseFromBoolVar(foreignTableId, base_relids, (Var*) node, quals, true))
         return;
       break;
 
@@ -347,7 +351,7 @@ void extractRestrictions(Relids base_relids, Expr *node, List **quals)
  *	- Const operator: the operator representation
  *	- Var or Const value: the value.
  */
-bool extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
+bool extractClauseFromOpExpr(Oid foreignTableId, Relids base_relids, OpExpr *op, List **quals)
 {
   Var *left;
   Expr *right;
@@ -379,7 +383,7 @@ bool extractClauseFromOpExpr(Relids base_relids, OpExpr *op, List **quals)
   return true;
 }
 
-bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *op, List **quals)
+bool extractClauseFromScalarArrayOpExpr(Oid foreignTableId, Relids base_relids, ScalarArrayOpExpr *op, List **quals)
 {
   Var *left;
   Expr *right;
@@ -409,7 +413,7 @@ bool extractClauseFromScalarArrayOpExpr(Relids base_relids, ScalarArrayOpExpr *o
  *	Convert a "NullTest" (IS NULL, or IS NOT NULL)
  *	to a suitable intermediate representation.
  */
-bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
+bool extractClauseFromNullTest(Oid foreignTableId, Relids base_relids, NullTest *node, List **quals)
 {
   MulticornBaseQual *result = NULL;
   char *opname = NULL;
@@ -470,7 +474,7 @@ bool extractClauseFromNullTest(Relids base_relids, NullTest *node, List **quals)
  *  When a variable is the entire expression (bool fields) we extract the value
  *  and save the desired state in the operator [True|False]
  */
-bool extractClauseFromBoolVar(Relids base_relids, Var *varNode, List **quals, bool value)
+bool extractClauseFromBoolVar(Oid foreignTableId, Relids base_relids, Var *varNode, List **quals, bool value)
 {
   if(varNode->vartype != BOOLOID)
     return false;
@@ -487,7 +491,7 @@ bool extractClauseFromBoolVar(Relids base_relids, Var *varNode, List **quals, bo
   return true;
 }
 
-bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **quals)
+bool extractClauseBoolVarFromBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr* op, List **quals)
 {
   // handle inverted clauses on boolean fields(i.e. field == False)
 
@@ -502,7 +506,7 @@ bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **q
   if (!IsA(arg, Var))
     return false;
 
-  return extractClauseFromBoolVar(base_relids, (Var *)arg, quals,
+  return extractClauseFromBoolVar(foreignTableId, base_relids, (Var *)arg, quals,
                                   /*not this*/ false);
 }
 
@@ -511,7 +515,7 @@ bool extractClauseBoolVarFromBoolExpr(Relids base_relids, BoolExpr* op, List **q
  * i.e.  intfield BETWEEN 8.0 and 12.0
  */
 
-bool extractClauseBoundedBoolExpr(Relids base_relids, BoolExpr* op, List **quals)
+bool extractClauseBoundedBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr* op, List **quals)
 {
   if(op->boolop != AND_EXPR)
     return false;
@@ -528,8 +532,8 @@ bool extractClauseBoundedBoolExpr(Relids base_relids, BoolExpr* op, List **quals
   List* lowerList = NIL;
   List *upperList = NIL;
 
-  if (!extractClauseFromOpExpr(base_relids, (OpExpr *)lowerExpr, &lowerList) ||
-      !extractClauseFromOpExpr(base_relids, (OpExpr *)upperExpr, &upperList))
+  if (!extractClauseFromOpExpr(foreignTableId, base_relids, (OpExpr *)lowerExpr, &lowerList) ||
+      !extractClauseFromOpExpr(foreignTableId, base_relids, (OpExpr *)upperExpr, &upperList))
     return false;
 
   if (length(lowerList) != 1 || length(upperList) != 1)
@@ -589,9 +593,53 @@ bool extractClauseBoundedBoolExpr(Relids base_relids, BoolExpr* op, List **quals
 }
 
 /*
+ * Looking for null check on sample field which also include a null check on the
+ * sample id
+ * (p_filteredexomes2500_2_matrix.gt IS NULL AND NOT
+ *  p_filteredexomes2500_2_matrix._id IS NULL)
+ */
+bool extractClauseNullSampleBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr *node,
+                                     List **quals) {
+
+  if(node->boolop != AND_EXPR)
+    return false;
+
+  // only lookgin for nodes with an expression followed by a "NullTest"
+  if (list_length(node->args) != 2)
+    return false;
+
+  Expr* first = list_nth(node->args, 0);
+  Expr* second = list_nth(node->args, 1);
+
+  if (!IsA(first, NullTest) || !IsA(second, NullTest))
+    return false;
+
+  // check that the second null test is a check on the matrix id, which is never
+  // null and can be disregarded. No-op ftw  
+  NullTest* matrixIdNull = (NullTest*) second;
+
+  if (matrixIdNull->nulltesttype != IS_NOT_NULL)
+    return false;
+
+  if(!IsA(matrixIdNull->arg, Var))
+    return false;
+
+  Var *nullArg = (Var *)matrixIdNull->arg;
+
+  char *columnName = get_relid_attribute_name(foreignTableId, nullArg->varattno);
+  if (strcmp(columnName, "_id") != 0)
+    return false;
+
+  if (!nullArg->vartype == INT4OID)
+    return false;
+
+  return extractClauseFromNullTest(foreignTableId, base_relids, (NullTest*)first, quals);
+}
+
+/*
  *  Convert a BoolExpr [Not|Or|And] to a intermediate representation
  */
-bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
+bool extractClauseWithNullFromBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr *node,
                                       List **quals) {
   if(node->boolop != OR_EXPR)
     return false;
@@ -609,32 +657,34 @@ bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
 
     switch (nodeTag(subNode)) {
     case T_ScalarArrayOpExpr:
-      if (!extractClauseFromScalarArrayOpExpr(base_relids, (ScalarArrayOpExpr *)subNode, &exprList))
+      if (!extractClauseFromScalarArrayOpExpr(foreignTableId, base_relids, (ScalarArrayOpExpr *)subNode, &exprList))
         return false;
       break;
 
     case T_OpExpr:
-      if (!extractClauseFromOpExpr(base_relids, (OpExpr *)subNode, &exprList))
+      if (!extractClauseFromOpExpr(foreignTableId, base_relids, (OpExpr *)subNode, &exprList))
         return false;
 
       break;
     case T_NullTest:
-      if(length(nullQualList) > 0)
-        return false;
-      if(!extractClauseFromNullTest(base_relids, (NullTest*)subNode, &nullQualList))
+      if (!extractClauseFromNullTest(foreignTableId, base_relids,
+                                     (NullTest *)subNode, &nullQualList))
         return false;
       break;
 
     case T_BoolExpr:
-      if (!extractClauseBoolVarFromBoolExpr(base_relids, (BoolExpr *)subNode,
-                                            &exprList) &&
-          !extractClauseBoundedBoolExpr(base_relids, (BoolExpr *)subNode,
-                                        &exprList))
+      if (!extractClauseBoolVarFromBoolExpr(foreignTableId, base_relids,
+                                            (BoolExpr *)subNode, &exprList) &&
+          !extractClauseBoundedBoolExpr(foreignTableId, base_relids,
+                                        (BoolExpr *)subNode, &exprList) &&
+          !extractClauseNullSampleBoolExpr(foreignTableId, base_relids,
+                                           (BoolExpr *)subNode, &nullQualList))
 
         return false;
     // this happens with sample filters -> may need to revisit
     // there is a nested 'sample is not null' and 'sample value is not null'
     // this would be added to the null qual list if collapsed
+      break;
     default:
       return false;
     }
@@ -659,7 +709,7 @@ bool extractClauseWithNullFromBoolExpr(Relids base_relids, BoolExpr *node,
 /*
  * Extract inverted from bool expr
  */ 
-bool extractInvertedBoolExpr(Relids base_relids, BoolExpr *op,
+bool extractInvertedBoolExpr(Oid foreignTableId, Relids base_relids, BoolExpr *op,
                                       List **quals)
 {
   if (op->boolop != NOT_EXPR)
@@ -671,7 +721,7 @@ bool extractInvertedBoolExpr(Relids base_relids, BoolExpr *op,
   Expr *arg = (Expr *)list_nth(op->args, 0);
 
   List* extracted = NIL;
-  extractRestrictions(base_relids, arg, &extracted);
+  extractRestrictions(foreignTableId, base_relids, arg, &extracted);
 
   if(length(extracted) != 1)
     return false;

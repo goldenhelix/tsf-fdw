@@ -291,7 +291,7 @@ ScalarArrayOpExpr *canonicalScalarArrayOpExpr(ScalarArrayOpExpr *opExpr, Relids 
  */
 void extractRestrictions(Relids base_relids, Expr *node, List **quals)
 {
-  elog(WARNING, "extractRestrictions: - %s",nodeToString(node));
+  //elog(WARNING, "extractRestrictions: - %s",nodeToString(node));
   switch (nodeTag(node)) {
 
     case T_OpExpr:

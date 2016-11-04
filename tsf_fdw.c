@@ -1010,13 +1010,13 @@ static ForeignScan *TsfGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oi
       // are found. Otherwise we can have any number of internalizable
       // restriction expressions.
       if (isIdRestriction(foreignTableId, qual)) {
-        ListCell *tsflc;//put the other internable restrictions back 
-        foreach (tsflc, tsfExprs) {
-          localExprs = lappend(localExprs, lfirst(tsflc));
-        }
-        tsfExprs = NIL;
+        //ListCell *tsflc;//put the other internable restrictions back 
+        //      foreach (tsflc, tsfExprs) {
+        //localExprs = lappend(localExprs, lfirst(tsflc));
+        //}
+        //      tsfExprs = NIL;
         tsfExprs = lappend(tsfExprs, rinfo->clause);
-        foundIdRestriction = true;
+        //foundIdRestriction = false; //true;
 
       } else if (isEntityIdRestriction(foreignTableId, qual)) {
         entityClauses = lappend(entityClauses, rinfo->clause);

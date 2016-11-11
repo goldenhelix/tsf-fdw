@@ -672,6 +672,12 @@ bool extractClauseWithNullFromBoolExpr(Oid foreignTableId, Relids base_relids, B
         return false;
       break;
 
+    case T_Var:
+      if (!extractClauseFromBoolVar(foreignTableId, base_relids, (Var *)subNode,
+                                    &exprList, true))
+        return false;
+      break;
+
     case T_BoolExpr:
       if (!extractClauseBoolVarFromBoolExpr(foreignTableId, base_relids,
                                             (BoolExpr *)subNode, &exprList) &&

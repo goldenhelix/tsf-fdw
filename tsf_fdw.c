@@ -1766,8 +1766,9 @@ static bool isEntityIdRestriction(Oid foreignTableId, MulticornBaseQual *qual)
   return false;
 }
 
-static bool numericCompareOperator(const char* optString)
+static bool numericCompareOperator(MulticornBaseQual *qual)
 {
+  char* optString = qual->opname;
   if (strcmp(optString, "=") == 0)
     return true;
   if (strcmp(optString, "<=") == 0)
@@ -1783,31 +1784,65 @@ static bool numericCompareOperator(const char* optString)
   return false;
 }
 
-static bool arrayCompareOperator(const char* optString)
+static bool arrayContainsOperator(MulticornBaseQual *qual)
 {
+  char* optString = qual->opname;
   // ex. p_exampletumornormalpairanalysis2_19.id @> ARRAY['rs2271500']::text[]
-  if (strcmp(optString, "<@") == 0)
+  //only support contains in this direction as '<@' would break the short circuit and logic
+
+  // can onlu support queries where the contains is a single element const list
+  if (strcmp(optString, "@>") != 0)
+    return false;
+
+  if (qual->right_type != T_Const)
+    return false;
+
+  if (qual->typeoid != TEXTARRAYOID && qual->typeoid != TEXTARRAYOID &&
+      qual->typeoid != TEXTARRAYOID)
+    return false;
+
+  ArrayType *strArray = DatumGetArrayTypeP(((MulticornConstQual *)qual)->value);
+
+  int *dim = ARR_DIMS(strArray);
+  if (dim[0] != 1)
+    return false;
+
+  return true;
+}
+
+static bool numericArrayCompareOperator(MulticornBaseQual *qual)
+{
+  char* optString = qual->opname;
+  if (strcmp(optString, "<=") == 0)
     return true;
-  if (strcmp(optString, "@>") == 0)
+  if (strcmp(optString, ">=") == 0)
+    return true;
+  if (strcmp(optString, "<") == 0)
+    return true;
+  if (strcmp(optString, ">") == 0)
+    return true;
+  if(arrayContainsOperator(qual))
     return true;
 
   return false;
 }
 
-static bool textArrayCompareOpterator(const char* optString)
+static bool textArrayCompareOpterator(MulticornBaseQual *qual)
 {
-  if(arrayCompareOperator(optString))
+  if (arrayContainsOperator(qual))
     return true;
 
   // ex. effect && '{LoF,Missense}'::text[]
-  if (strcmp(optString, "&&") == 0)
+  if (strcmp(qual->opname, "&&") == 0)
     return true;
 
   return false;
 }
 
-static bool textCompareOperator(const char* optString)
+static bool textCompareOperator(MulticornBaseQual *qual)
 {
+  char *optString = qual->opname;
+
   if (strcmp(optString, "=") == 0)
     return true;
   if (strcmp(optString, "<>") == 0)
@@ -1822,7 +1857,6 @@ static bool textCompareOperator(const char* optString)
   return false;
 }
 
-
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
 //  elog(WARNING, "isInternableRestriction::oid type %d",
@@ -1830,57 +1864,63 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 
   int attType = get_atttype(foreignTableId, qual->varattno);
 
-  bool nullTest = false;
   if(qual->right_type == T_Const){
     MulticornConstQual* constQual = (MulticornConstQual*)qual;
-    nullTest = constQual->isnull;
+    bool nullTest = constQual->isnull;
+
+    if (nullTest) {
+      char *optString = qual->opname;
+      if (strcmp(optString, "=") == 0)
+        return true;
+      if (strcmp(optString, "<>") == 0)
+        return true;
+    }
   }
 
-  switch(attType) {
+  if ((qual->isArray && qual->useOr) || !qual->isArray) {
+    switch (attType) {
     case INT4OID:
     case INT2OID:
-      // isArray and useOr may be null for is 'null'quals (const type)
-      if (qual->isArray != qual->useOr)
+      if (!numericCompareOperator(qual))
         break;
-      if(!numericCompareOperator(qual->opname))
-        break;
-      if (!nullTest && qual->typeoid != NUMERICOID &&
+      if (qual->typeoid != NUMERICOID &&
           qual->typeoid != NUMERICRANGEOID)
         break;
+
       return true;
 
     case INT4ARRAYOID:
     case INT2ARRAYOID:
-      if (qual->isArray != qual->useOr)
+      if (!numericArrayCompareOperator(qual))
         break;
-      if (!numericCompareOperator(qual->opname) &&
-          !arrayCompareOperator(qual->opname))
+      if (qual->typeoid != NUMERICOID && qual->typeoid != NUMERICRANGEOID)
         break;
-      if (!nullTest && qual->typeoid != NUMERICOID &&
-          qual->typeoid != NUMERICRANGEOID)
-        break;
+
       return true;
 
     case FLOAT4OID:
     case FLOAT8OID:
+      if (!numericCompareOperator(qual))
+        break;
+      if (qual->typeoid != NUMERICOID && qual->typeoid != FLOAT8OID &&
+          qual->typeoid != NUMERICRANGEOID)
+        break;
+
+      return true;
+
     case FLOAT4ARRAYOID:
     case 1022: // FLOAT8ARRAYOID: //no #define
-      if (qual->isArray != qual->useOr)
+      if (!numericArrayCompareOperator(qual))
         break;
-      if (!numericCompareOperator(qual->opname) &&
-          !arrayCompareOperator(qual->opname))
-        break;
-      if (!nullTest && qual->typeoid != NUMERICOID &&
-          qual->typeoid != FLOAT8OID && qual->typeoid != NUMERICRANGEOID)
+      if (qual->typeoid != NUMERICOID && qual->typeoid != FLOAT8OID &&
+          qual->typeoid != NUMERICRANGEOID)
         break;
 
       return true;
 
     case TEXTOID:
-      if (qual->isArray != qual->useOr)
-        break;
       // ex. effectcombined = ANY ('{LoF,Missense}'::text[])
-      if (!textCompareOperator(qual->opname))
+      if (!textCompareOperator(qual))
         break;
 
       if (qual->right_type != T_Const)
@@ -1889,7 +1929,7 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
       if (qual->typeoid != TEXTARRAYOID && qual->typeoid != TEXTOID)
         break;
 
-      if (qual->typeoid == TEXTARRAYOID && !nullTest) {
+      if (qual->typeoid == TEXTARRAYOID) {
         // only compare against a single constant
         ArrayType *strArray =
             DatumGetArrayTypeP(((MulticornConstQual *)qual)->value);
@@ -1903,16 +1943,16 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
       if (qual->right_type != T_Const)
         break;
 
-      if (!textArrayCompareOpterator(qual->opname) &&
-          !(strcmp(qual->opname, "<>") == 0 && nullTest))
+      if (!textArrayCompareOpterator(qual))
         break;
 
       if (qual->typeoid != TEXTARRAYOID && qual->typeoid != TEXTOID)
         break;
 
-      if (qual->typeoid == TEXTARRAYOID && !nullTest) {
+      if (qual->typeoid == TEXTARRAYOID) {
         // only compare against a single constant
-        ArrayType *strArray = DatumGetArrayTypeP(((MulticornConstQual *)qual)->value);
+        ArrayType *strArray =
+            DatumGetArrayTypeP(((MulticornConstQual *)qual)->value);
         int *dim = ARR_DIMS(strArray);
         if (dim[0] != 1)
           break;
@@ -1920,19 +1960,18 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
       return true;
 
     case BOOLOID:
-      if (qual->typeoid != BOOLOID && !nullTest)
+      if (qual->typeoid != BOOLOID && qual->typeoid != 1000)
         return false;
       return true;
     }
+  }
+  // Look up the type for this field.
+  char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
+  elog(INFO, "isInternableFailed! %s[%d] %s isArray[%d] useOr[%d] typeoid[%d]",
+       columnName, get_atttype(foreignTableId, qual->varattno), qual->opname,
+       qual->isArray, qual->useOr, qual->typeoid);
 
-    // Look up the type for this field.
-    char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
-    elog(INFO,
-         "isInternableFailed! %s[%d] %s isArray[%d] useOr[%d] typeoid[%d]",
-         columnName, get_atttype(foreignTableId, qual->varattno), qual->opname,
-         qual->isArray, qual->useOr, qual->typeoid);
-
-    return false;
+  return false;
 }
 
 /*
@@ -2294,9 +2333,48 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       r->includeTrue = (strcmp(qual->opname, "True") == 0);
       r->includeFalse = (strcmp(qual->opname, "False") == 0);
     }else if(qual->typeoid == 1000){//BOOARRAYOID (no # define)
-      //multiple values has to be -> true and false
-      r->includeTrue = true;
-      r->includeFalse = true;
+      ArrayType *array = DatumGetArrayTypeP(value);
+      ArrayIterator iterator = array_create_iterator(array, 0, NULL);
+
+      Datum itrValue;
+      bool itrIsNull;
+      while (array_iterate(iterator, &itrValue, &itrIsNull)) {
+        if (itrIsNull) {
+          r->base.includeMissing = true;
+          continue;
+        }
+        bool v = DatumGetBool(itrValue);
+        if(v){
+          r->includeTrue = true;
+        }else{
+          r->includeFalse = true;
+        }
+      }
+    }else if(qual->typeoid == TEXTOID){
+      const char *str = TextDatumGetCString(value);
+      if (stricmp(str, "missing") || stricmp(str, "?")) {
+        r->base.includeMissing = true;
+      }
+      r->includeTrue = (stricmp(str, "True") == 0);
+      r->includeFalse = (stricmp(str, "False") == 0);
+    }else if(qual->typeoid == TEXTARRAYOID){
+      ArrayType *array = DatumGetArrayTypeP(value);
+      ArrayIterator iterator = array_create_iterator(array, 0, NULL);
+
+      Datum itrValue;
+      bool itrIsNull;
+      while (array_iterate(iterator, &itrValue, &itrIsNull)) {
+        if (itrIsNull) {
+          r->base.includeMissing = true;
+          continue;
+        }
+        char *str = TextDatumGetCString(itrValue);
+        if (stricmp(str, "missing") || stricmp(str, "?")) {
+          r->base.includeMissing = true;
+        }
+        r->includeTrue = (stricmp(str, "True") == 0);
+        r->includeFalse = (stricmp(str, "False") == 0);
+      }
     }
     return;
   }

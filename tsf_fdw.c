@@ -2298,11 +2298,14 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
     if (qual->typeoid == TEXTOID) {
       const char *str = TextDatumGetCString(value);
+
       int enumIdx = findEnumIdx(field, str);
       if (enumIdx >= 0) {
         r->include[r->includeCount++] = enumIdx;
       }
-
+      if(stricmp("missing", str) == 0 && enumIdx < 0){
+        r->base.includeMissing = true;
+      }
     } else if (qual->typeoid == TEXTARRAYOID) {
       ArrayType *strArray = DatumGetArrayTypeP(value);
       ArrayIterator iterator = array_create_iterator(strArray, 0, NULL);
@@ -2318,6 +2321,9 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
         int enumIdx = findEnumIdx(field, str);
         if (enumIdx >= 0) {
           r->include[r->includeCount++] = enumIdx;
+        }
+        if(stricmp("missing", str) == 0 && enumIdx < 0){
+          r->base.includeMissing = true;
         }
       }
     }

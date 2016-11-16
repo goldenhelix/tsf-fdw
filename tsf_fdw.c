@@ -1402,18 +1402,18 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
       if (col->iter) {
         ereport(
             WARNING,
-            (errmsg("col[%d] iter (%de) stats: Read %d chunks (%lld/%lld "
-                    "decompressed) in %dms + %dms to decompress. %d/%d "
+            (errmsg("col[%d] iter (%de) stats: Read %lld chunks (%lld/%lld "
+                    "decompressed) in %dms + %dms to decompress. %lld/%lld "
                     "records in cur chunk (%.2f%%).",
                     col->columnIndex,
                     col->iter->entity_count < 0 ? 0 :col->iter->entity_count,
-                    col->iter->stats.read_chunks,
-                    col->iter->stats.read_chunk_bytes,
-                    col->iter->stats.decompressed_bytes,
-                    ((int)col->iter->stats.read_time/1000),
-                    ((int)col->iter->stats.decompress_time/1000),
-                    col->iter->stats.records_in_mem,
-                    col->iter->stats.records_total,
+                    (long long)col->iter->stats.read_chunks,
+                    (long long)col->iter->stats.read_chunk_bytes,
+                    (long long)col->iter->stats.decompressed_bytes,
+                    ((int)(col->iter->stats.read_time/1000)),
+                    ((int)(col->iter->stats.decompress_time/1000)),
+                    (long long)col->iter->stats.records_in_mem,
+                    (long long)col->iter->stats.records_total,
                     ((float)col->iter->stats.records_in_mem /
                      col->iter->stats.records_total)*100)));
       }
@@ -1426,14 +1426,17 @@ static void TsfEndForeignScan(ForeignScanState *scanState)
       if (iter) {
         ereport(
             WARNING,
-            (errmsg("source[%d] mapping iter stats: Read %d chunks (%lld"
-                    "/%lld decompressed) in %dms + %dms to decompress. %d/%d "
+            (errmsg("source[%d] mapping iter stats: Read %lld chunks (%lld"
+                    "/%lld decompressed) in %dms + %dms to decompress. %lld/%lld "
                     "records in cur chunk (%.2f%%).",
-                    i, iter->stats.read_chunks, iter->stats.read_chunk_bytes,
-                    iter->stats.decompressed_bytes,
-                    ((int)iter->stats.read_time / 1000),
-                    ((int)iter->stats.decompress_time / 1000),
-                    iter->stats.records_in_mem, iter->stats.records_total,
+                    i,
+                    (long long)iter->stats.read_chunks,
+                    (long long)iter->stats.read_chunk_bytes,
+                    (long long)iter->stats.decompressed_bytes,
+                    ((int)(iter->stats.read_time / 1000)),
+                    ((int)(iter->stats.decompress_time / 1000)),
+                    (long long)iter->stats.records_in_mem,
+                    (long long)iter->stats.records_total,
                     ((float)iter->stats.records_in_mem /
                      iter->stats.records_total) *
                         100)));

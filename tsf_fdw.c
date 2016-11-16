@@ -177,7 +177,6 @@ typedef struct EnumRestriction {
   RestrictionBase base;
   int includeCount;
   int *include;  // Enum indexes to include
-  bool doesNotMatch;
 } EnumRestriction;
 
 typedef struct BoolRestriction {
@@ -191,7 +190,6 @@ typedef struct StringRestriction {
   int matchCount;
   Size matchSize;
   char *match;  // Exact match
-  bool doesNotMatch;
   int (*strcmpfn)(const char*,const char*);
 } StringRestriction;
 
@@ -1174,7 +1172,6 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field,
     StringRestriction *r = palloc0(sizeof(StringRestriction));
     r->base.col = col;
     r->base.type = RestrictString;
-    r->doesNotMatch = false;
     r->matchCount = 0;
     r->matchSize = 0;
 
@@ -1860,6 +1857,15 @@ static bool textCompareOperator(MulticornBaseQual *qual)
   return false;
 }
 
+static bool notEqualOp(char* opName)
+{
+  if(strcmp("<>", opName) == 0)
+    return true;
+  if(strcmp("!=", opName) == 0)
+    return true;
+  return false;
+}
+
 static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
 {
 //  elog(WARNING, "isInternableRestriction::oid type %d",
@@ -1875,7 +1881,7 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
       char *optString = qual->opname;
       if (strcmp(optString, "=") == 0)
         return true;
-      if (strcmp(optString, "<>") == 0)
+      if (notEqualOp(optString))
         return true;
     }
   }
@@ -2084,27 +2090,21 @@ static double numericToDouble(Numeric num)
   return strtod(valStr, NULL);
 }
 
-static bool notEqual(char* opName)
-{
-  if(strcmp("<>", opName) == 0)
-    return true;
-  if(strcmp("!=", opName) == 0)
-    return true;
-  return false;
-}
-
 static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
                                  MulticornBaseQual *qual, Datum value,
                                  bool isNull) {
   restriction->inverted = qual->inverted;
   restriction->includeMissing = qual->includeMissing;
 
+  if (notEqualOp(qual->opname))
+    restriction->inverted = !restriction->inverted;
+
+  if (isNull)
+    return;
+
   switch (field->value_type) {
   case TypeInt32:
   case TypeInt32Array: {
-    if(isNull)
-      return;
-
     IntRestriction *r = (IntRestriction *)restriction;
     r->lowerBound = INT_MIN;
     r->upperBound = INT_MAX;
@@ -2117,20 +2117,16 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
       r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
       r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
-      if(strcmp(qual->opname, "<>") == 0 || strcmp(qual->opname, "=") == 0 ){
+      if(notEqualOp(qual->opname) || strcmp(qual->opname, "=") == 0 ){
         r->lowerBound = bound;
         r->upperBound = bound;
         r->includeLowerBound = true;
         r->includeUpperBound = true;
-
-        if(strcmp(qual->opname, "<>") == 0){
-          restriction->inverted = ! restriction->inverted;
-        }
       }
       return;
 
     } else {                         // range type
-      Assert(qual->typeoid == NUMERICRANGEOID); 
+      Assert(qual->typeoid == NUMERICRANGEOID);
       RangeType *range = DatumGetRangeType(value);
 
       Oid rngtypid = RangeTypeGetOid(range);
@@ -2154,9 +2150,6 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   }
 
   case TypeInt64: {
-    if(isNull)
-      return;
-
     Int64Restriction *r = (Int64Restriction *)restriction;
     r->lowerBound = INT64_MIN;
     r->upperBound = INT64_MAX;
@@ -2170,15 +2163,11 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
       r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
 
-      if(strcmp(qual->opname, "<>") == 0 || strcmp(qual->opname, "=") == 0 ){
+      if (notEqualOp(qual->opname) || strcmp(qual->opname, "=") == 0) {
         r->lowerBound = bound;
         r->upperBound = bound;
         r->includeLowerBound = true;
         r->includeUpperBound = true;
-
-        if(strcmp(qual->opname, "<>") == 0){
-          restriction->inverted = ! restriction->inverted;
-        }
       }
       return;
 
@@ -2212,9 +2201,6 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeFloat32Array:
   case TypeFloat64:
   case TypeFloat64Array: {
-    if (isNull)
-      return;
-
     DoubleRestriction *r = (DoubleRestriction *)restriction;
 
     //not missig swap values
@@ -2232,15 +2218,11 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
       r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
 
-      if(strcmp(qual->opname, "<>") == 0 || strcmp(qual->opname, "=") == 0 ){
+      if(notEqualOp(qual->opname) || strcmp(qual->opname, "=") == 0 ){
         r->lowerBound = bound;
         r->upperBound = bound;
         r->includeLowerBound = true;
         r->includeUpperBound = true;
-
-        if(strcmp(qual->opname, "<>") == 0){
-          restriction->inverted = ! restriction->inverted;
-        }
       }
       return;
 
@@ -2254,21 +2236,17 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       r->includeLowerBound = (strcmp(qual->opname, ">=") == 0);
       r->includeUpperBound = (strcmp(qual->opname, "<=") == 0);
 
-      if(strcmp(qual->opname, "<>") == 0 || strcmp(qual->opname, "=") == 0 ){
+      if(notEqualOp(qual->opname) || strcmp(qual->opname, "=") == 0 ){
         r->lowerBound = bound;
         r->upperBound = bound;
         r->includeLowerBound = true;
         r->includeUpperBound = true;
-
-        if(strcmp(qual->opname, "<>") == 0){
-          restriction->inverted = ! restriction->inverted;
-        }
       }
 
       return;
 
     } else { // range
-      Assert(qual->typeoid == NUMERICRANGEOID); 
+      Assert(qual->typeoid == NUMERICRANGEOID);
       RangeType *range = DatumGetRangeType(value);
 
       Oid rngtypid = RangeTypeGetOid(range);
@@ -2293,11 +2271,8 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
 
   case TypeEnum:
   case TypeEnumArray: {
-    if (isNull)
-      return;
     EnumRestriction *r = (EnumRestriction *)restriction;
     r->includeCount = 0;
-    r->doesNotMatch = (strcmp(qual->opname, "<>") == 0);
 
     if (qual->typeoid == TEXTOID) {
       const char *str = TextDatumGetCString(value);
@@ -2332,10 +2307,9 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
     }
     return;
   }
+
   case TypeBool:
   case TypeBoolArray: {
-    if (isNull)
-      return;
     BoolRestriction *r = (BoolRestriction *)restriction;
     if (qual->typeoid == BOOLOID) {
       //only cheking for a single value
@@ -2391,10 +2365,6 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeString:
   case TypeStringArray: {
     StringRestriction* r = (StringRestriction*) restriction;
-    r->doesNotMatch = notEqual(qual->opname);
-    if (isNull)
-      return;
-
     if(strcmp(qual->opname, "~~*") == 0){
       r->strcmpfn = &stricmp;
     }else{
@@ -2609,7 +2579,7 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       StringRestriction *r = (StringRestriction *)restriction;
       const char *s = v_str(value);
       bool match = r->strcmpfn(s, r->match) == 0;
-      if(r->doesNotMatch == match) // this works, think about it...
+      if(r->base.inverted == match) // this works, think about it...
         return r->base.inverted;
       break;
     }
@@ -2621,7 +2591,7 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       bool matchOne = false;
       // r->include is list of acceptible indexes
       for (int j = 0; j < r->includeCount; j++) {
-        if ((idx == r->include[j]) != r->doesNotMatch) {
+        if ((idx == r->include[j]) != r->base.inverted) {
           matchOne = true;
           break;
         }
@@ -2736,7 +2706,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
             return !r->base.inverted;
         } else {
           bool match = r->strcmpfn(s, r->match) == 0;
-          if(r->doesNotMatch != match)
+          if(r->base.inverted != match)
             return !r->base.inverted;
         }
         // Advanced past next NULL
@@ -2758,7 +2728,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         } else {
           // r->include is list of acceptible indexes
           for (int j = 0; j < r->includeCount; j++) {
-            if ((idx == r->include[j]) != r->doesNotMatch)
+            if ((idx == r->include[j]) != r->base.inverted)
               return !r->base.inverted;
           }
         }

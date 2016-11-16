@@ -827,7 +827,12 @@ void collapseNullQuals(List **quals)
       // else we can colapse this null check into the is missing of current qual
       elog(INFO, "collapsed null test node. Include missing %d %d",
            qual->includeMissing, qual->inverted);
-      current->includeMissing = (qual->includeMissing != qual->inverted);
+
+      if(current->inverted == qual->inverted)
+        current->includeMissing = qual->includeMissing;
+      else
+        current->includeMissing = (qual->includeMissing != qual->inverted);
+
       trimmedList = list_delete_ptr(trimmedList, qual);
       break;
     }

@@ -2551,7 +2551,7 @@ static bool syncIter(tsf_iter *iter, tsf_iter *ref_iter)
 static bool evalRestrictionUnit(tsf_v value, bool is_null,
                                 RestrictionBase *restriction) {
   if (is_null) // iterator pulls this out, use it to filter here
-    return restriction->includeMissing;
+    return restriction->includeMissing != restriction->inverted;
 
   ColumnMapping *col = restriction->col;
   tsf_field *f = col->iter->fields[0];
@@ -2634,13 +2634,13 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
                errhint("Tsf field %s with type %d", f->name, f->value_type)));
     }
   }
-  return true;
+  return !restriction->inverted;
 }
 
 static bool evalRestrictionArray(tsf_v value, bool is_null,
                                  RestrictionBase *restriction) {
   if (is_null)
-    return restriction->includeMissing;
+    return restriction->includeMissing == restriction->inverted;
 
   // All array operators are OR logic, so all values must fail
   ColumnMapping *col = restriction->col;
@@ -2648,7 +2648,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
 
   int size = va_size(value);
   if(size == 0)
-    return restriction->includeMissing;
+    return restriction->includeMissing == restriction->inverted;
 
   switch (f->value_type) {
     case TypeInt32Array: {
@@ -2769,7 +2769,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
                errhint("Tsf field %s with type %d", f->name, f->value_type)));
     }
   }
-  return true; //presumed un-reachable
+  return restriction->inverted; //presumed un-reachable
 }
 
 bool iterateRecord(TsfFdwExecState *state) {

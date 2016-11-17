@@ -1138,13 +1138,13 @@ static RestrictionBase *buildRestriction(ColumnMapping *col, tsf_field *field,
     DoubleRestriction *r = palloc0(sizeof(DoubleRestriction));
     r->base.col = col;
     r->base.type = RestrictInt64;
-    r->upperBound = FLT_MIN;
+    r->upperBound = -FLT_MAX;
     r->lowerBound = FLT_MAX;
 
     if (field->value_type == TypeFloat32 || field->value_type == TypeFloat32Array)
       return (RestrictionBase *)r;
 
-    r->upperBound = DBL_MIN;
+    r->upperBound = -DBL_MAX;
     r->lowerBound = DBL_MAX;
     return (RestrictionBase *)r;
   }

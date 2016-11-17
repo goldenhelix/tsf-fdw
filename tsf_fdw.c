@@ -2058,7 +2058,7 @@ static int findEnumIdx(tsf_field* field, const char* str)
 
 static int numericToInt(Numeric num)
 {
-  char *valStr = numeric_out_sci(num, 0);
+  char *valStr = numeric_normalize(num);
   double numValue = strtod(valStr, NULL);
   int retValue = (int)numValue;
 
@@ -2072,7 +2072,7 @@ static int numericToInt(Numeric num)
 
 static int64_t numericToInt64(Numeric num)
 {
-  char *valStr = numeric_out_sci(num, 0);
+  char *valStr = numeric_normalize(num);
   double numValue = strtod(valStr, NULL);
   int64_t retValue = (int64_t)numValue;
 
@@ -2086,7 +2086,7 @@ static int64_t numericToInt64(Numeric num)
 
 static double numericToDouble(Numeric num)
 {
-  char *valStr = numeric_out_sci(num, 0);
+  char *valStr = numeric_normalize(num);
   return strtod(valStr, NULL);
 }
 

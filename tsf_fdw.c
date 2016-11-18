@@ -2591,9 +2591,10 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
 
       EnumRestriction *r = (EnumRestriction *)restriction;
       int idx = v_int32(value);
-      // r->include is list of acceptible indexes
-      if (r->includeCount == 0)//
-        return !restriction->inverted;
+      //if include count is zero it checks 'if missing'
+      // and this value is by definition not missing
+      if (r->includeCount == 0)
+        return !restriction->includeMissing;
 
       for (int j = 0; j < r->includeCount; j++) {
         if ((idx == r->include[j]) != r->base.inverted) {
@@ -2720,8 +2721,10 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       Assert(restriction->type == RestrictionEnum);
 
       EnumRestriction *r = (EnumRestriction *)restriction;
-      if (r->includeCount == 0)//
-        return !restriction->inverted;
+      //if include count is zero it checks 'if missing'
+      // and this value is by definition not missing
+      if (r->includeCount == 0)
+        return !restriction->includeMissing;
 
       for (int i = 0; i < size; i++) {
         int idx = va_int32(value, i);

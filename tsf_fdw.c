@@ -2283,7 +2283,10 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
         r->include[r->includeCount++] = enumIdx;
       }
       if(stricmp("missing", str) == 0 && enumIdx < 0){
-        r->base.includeMissing = true;
+        //handle special case of missing included in enum symbols
+        //we need to take the equality operator into account
+        // ie Zygosity <> "Missing"
+        r->base.includeMissing = !notEqualOp(qual->opname);
       }
     } else if (qual->typeoid == TEXTARRAYOID) {
       ArrayType *strArray = DatumGetArrayTypeP(value);
@@ -2302,7 +2305,7 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
           r->include[r->includeCount++] = enumIdx;
         }
         if(stricmp("missing", str) == 0 && enumIdx < 0){
-          r->base.includeMissing = true;
+          r->base.includeMissing = !notEqualOp(qual->opname);
         }
       }
     }
@@ -2589,6 +2592,9 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       EnumRestriction *r = (EnumRestriction *)restriction;
       int idx = v_int32(value);
       // r->include is list of acceptible indexes
+      if (r->includeCount == 0)//
+        return !restriction->inverted;
+
       for (int j = 0; j < r->includeCount; j++) {
         if ((idx == r->include[j]) != r->base.inverted) {
           //this is the one case in this method where we short circuit on acceptance
@@ -2714,6 +2720,9 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       Assert(restriction->type == RestrictionEnum);
 
       EnumRestriction *r = (EnumRestriction *)restriction;
+      if (r->includeCount == 0)//
+        return !restriction->inverted;
+
       for (int i = 0; i < size; i++) {
         int idx = va_int32(value, i);
         if (idx == INT_MISSING) {

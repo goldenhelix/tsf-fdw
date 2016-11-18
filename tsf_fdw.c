@@ -1975,10 +1975,10 @@ static bool isInternableRestriction(Oid foreignTableId, MulticornBaseQual *qual)
     }
   }
   // Look up the type for this field.
-  char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
-  elog(INFO, "isInternableFailed! %s[%d] %s isArray[%d] useOr[%d] typeoid[%d]",
-       columnName, get_atttype(foreignTableId, qual->varattno), qual->opname,
-       qual->isArray, qual->useOr, qual->typeoid);
+  // char *columnName = get_relid_attribute_name(foreignTableId, qual->varattno);
+  // elog(INFO, "isInternableFailed! %s[%d] %s isArray[%d] useOr[%d] typeoid[%d]",
+  //     columnName, get_atttype(foreignTableId, qual->varattno), qual->opname,
+  //     qual->isArray, qual->useOr, qual->typeoid);
 
   return false;
 }

@@ -82,7 +82,7 @@
 #define NUMERICRANGEOID 3906
 #endif
 
-#define REPORT_ITER_STATS 1
+// #define REPORT_ITER_STATS 1
 
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;

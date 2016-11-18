@@ -2096,8 +2096,9 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   restriction->inverted = qual->inverted;
   restriction->includeMissing = qual->includeMissing;
 
-  if (notEqualOp(qual->opname))
+  if (notEqualOp(qual->opname)){
     restriction->inverted = !restriction->inverted;
+  }
 
   if (isNull)
     return;
@@ -2524,7 +2525,7 @@ static bool syncIter(tsf_iter *iter, tsf_iter *ref_iter)
 static bool evalRestrictionUnit(tsf_v value, bool is_null,
                                 RestrictionBase *restriction) {
   if (is_null) // iterator pulls this out, use it to filter here
-    return restriction->includeMissing != restriction->inverted;
+    return restriction->includeMissing;
 
   ColumnMapping *col = restriction->col;
   tsf_field *f = col->iter->fields[0];
@@ -2579,8 +2580,7 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
       StringRestriction *r = (StringRestriction *)restriction;
       const char *s = v_str(value);
       bool match = r->strcmpfn(s, r->match) == 0;
-      if(r->base.inverted == match) // this works, think about it...
-        return r->base.inverted;
+      return r->base.inverted != match;// this works, think about it...
       break;
     }
     case TypeEnum: {
@@ -2588,16 +2588,14 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
 
       EnumRestriction *r = (EnumRestriction *)restriction;
       int idx = v_int32(value);
-      bool matchOne = false;
       // r->include is list of acceptible indexes
       for (int j = 0; j < r->includeCount; j++) {
         if ((idx == r->include[j]) != r->base.inverted) {
-          matchOne = true;
-          break;
+          //this is the one case in this method where we short circuit on acceptance
+          return true;
         }
       }
-      if (!matchOne)
-        return r->base.inverted;
+      return false;
       break;
     }
     default: {
@@ -2610,10 +2608,14 @@ static bool evalRestrictionUnit(tsf_v value, bool is_null,
   return !restriction->inverted;
 }
 
+#define NUM_IN_BOUND(v, r)                                                     \
+  ((r->includeLowerBound ? (v >= r->lowerBound) : (v > r->lowerBound)) &&      \
+   (r->includeUpperBound ? (v <= r->upperBound) : (v < r->upperBound)))
+
 static bool evalRestrictionArray(tsf_v value, bool is_null,
                                  RestrictionBase *restriction) {
   if (is_null)
-    return restriction->includeMissing == restriction->inverted;
+    return restriction->includeMissing;
 
   // All array operators are OR logic, so all values must fail
   ColumnMapping *col = restriction->col;
@@ -2621,7 +2623,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
 
   int size = va_size(value);
   if(size == 0)
-    return restriction->includeMissing == restriction->inverted;
+    return restriction->includeMissing;
 
   switch (f->value_type) {
     case TypeInt32Array: {
@@ -2632,15 +2634,12 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         int v = va_int32(value, i);
         if (v == INT_MISSING) {
           if (restriction->includeMissing)
-            return !r->base.inverted;
-        } else if ((r->includeLowerBound ? (v >= r->lowerBound)
-                                         : (v > r->lowerBound)) &&
-                   (r->includeUpperBound ? (v <= r->upperBound)
-                    : (v < r->upperBound))){
-          return !r->base.inverted;
+            return true;
+        } else if (NUM_IN_BOUND(v, r) != r->base.inverted) {
+          return true;
         }
       }
-      return r->base.inverted;
+      return false;
     }
     case TypeFloat32Array: {
       Assert(restriction->type == RestrictDouble);
@@ -2650,15 +2649,12 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         float vf = va_float32(value, i);
         if (vf == FLOAT_MISSING) {
           if (restriction->includeMissing)
-            return !r->base.inverted;
-        } else if ((r->includeLowerBound ? (vf >= r->lowerBound)
-                                         : (vf > r->lowerBound)) &&
-                   (r->includeUpperBound ? (vf <= r->upperBound)
-                                         : (vf < r->upperBound))) {
-          return !r->base.inverted;
+            return true;
+        } else if (NUM_IN_BOUND(vf, r) != r->base.inverted) {
+          return true;
         }
       }
-      return r->base.inverted;
+      return false;
     }
     case TypeFloat64Array: {
       Assert(restriction->type == RestrictDouble);
@@ -2668,15 +2664,12 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         double v = va_float64(value, i);
         if (v == DOUBLE_MISSING) {
           if (restriction->includeMissing)
-            return !r->base.inverted;
-        } else if ((r->includeLowerBound ? (v >= r->lowerBound)
-                                         : (v > r->lowerBound)) &&
-                   (r->includeUpperBound ? (v <= r->upperBound)
-                                         : (v < r->upperBound))) {
-          return !r->base.inverted;
+            return true;
+        } else if (NUM_IN_BOUND(v, r) != r->base.inverted) {
+          return true;
         }
       }
-      return r->base.inverted;
+      return false;
     }
     case TypeBoolArray: {
       Assert(restriction->type == RestrictBool);
@@ -2684,15 +2677,15 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       BoolRestriction *r = (BoolRestriction *)restriction;
       for (int i = 0; i < size; i++) {
         char v = va_bool(value, i);
-        if (v == BOOL_MISSING) {
-          if (restriction->includeMissing)
-            return !r->base.inverted;
+        if (v == BOOL_MISSING && restriction->includeMissing) {
+          return true;
         } else {
-          if ((v && r->includeTrue) || (!v && r->includeFalse))
-            return !r->base.inverted;
+          bool match = ((v && r->includeTrue) || (!v && r->includeFalse));
+          if (match != r->base.inverted)
+            return true;
         }
       }
-      return r->base.inverted;
+      return false;
     }
     case TypeStringArray: {
       Assert(restriction->type == RestrictString);
@@ -2701,20 +2694,21 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
       const char *s = va_array(value);
       for (int i = 0; i < size; i++) {
         bool isnull = s[0] == '\0' || (s[0] == '?' && s[1] == '\0');
-        if (isnull) {
-          if (restriction->includeMissing != r->base.inverted)
-            return !r->base.inverted;
+        if (isnull){
+          if (restriction->includeMissing)
+            return true;
         } else {
           bool match = r->strcmpfn(s, r->match) == 0;
-          if(r->base.inverted != match)
-            return !r->base.inverted;
+          if (r->base.inverted != match)
+            return true;
         }
         // Advanced past next NULL
         while (s[0] != '\0') // increment to next NULL
           s++;
         s++; // go past the NULL
       }
-      return r->base.inverted;
+      // none of them matched (or if inverted: none did not match)
+      return false;
     }
     case TypeEnumArray: {
       Assert(restriction->type == RestrictionEnum);
@@ -2724,16 +2718,16 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
         int idx = va_int32(value, i);
         if (idx == INT_MISSING) {
           if (restriction->includeMissing)
-            return !r->base.inverted;
+            return true;
         } else {
           // r->include is list of acceptible indexes
           for (int j = 0; j < r->includeCount; j++) {
             if ((idx == r->include[j]) != r->base.inverted)
-              return !r->base.inverted;
+              return true;
           }
         }
       }
-      return r->base.inverted;
+      return false;
     }
     default: {
       ereport(ERROR,
@@ -2742,7 +2736,7 @@ static bool evalRestrictionArray(tsf_v value, bool is_null,
                errhint("Tsf field %s with type %d", f->name, f->value_type)));
     }
   }
-  return restriction->inverted; //presumed un-reachable
+  return false; //presumed un-reachable
 }
 
 bool iterateRecord(TsfFdwExecState *state) {
@@ -2805,7 +2799,7 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
 
           // If NULL mapping, rely on includeMissing
           if (size == 0) {
-            if (restriction->includeMissing != restriction->inverted) {
+            if (restriction->includeMissing) {
               continue; // satisfies restriction
             } else {
               allRestrictionsSatisifed = false;
@@ -2850,7 +2844,7 @@ static bool iterateWithRestrictions(TsfFdwExecState *state) {
           Assert(mf->value_type == TypeInt32);
           // TODO: confirm this case sometimes happens
           if(col->mappingIter->cur_nulls[0]){
-            if (restriction->includeMissing != restriction->inverted) {
+            if (restriction->includeMissing) {
               continue; // satisfies restriction
             } else {
               allRestrictionsSatisifed = false;

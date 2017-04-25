@@ -2555,20 +2555,30 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeString:
   case TypeStringArray: {
     StringRestriction* r = (StringRestriction*) restriction;
-    if(strcmp(qual->opname, "~~") == 0){
+    r->strcmpfn = &strcmp;
+
+    bool hasPatternChar = false;
+    for(int i = 0; i < r->matchSize; i++){
+      if(r->match[i] == '%' || r->match[i] == '_'){
+        hasPatternChar = true;
+        break;
+      }
+    }
+
+    if (hasPatternChar && strcmp(qual->opname, "~~") == 0) {
       r->strcmpfn = &strlike;
 
     } else if (strcmp(qual->opname, "~~*") == 0) {
-      r->strcmpfn = &strilike;
+      if(hasPatternChar)
+        r->strcmpfn = &strilike;
+      else
+        r->strcmpfn = &stricmp;
 
     } else if (strcmp(qual->opname, "!~~") == 0) {
       r->strcmpfn = &notstrlike;
 
     } else if (strcmp(qual->opname, "!~~*") == 0) {
       r->strcmpfn = &notstrilike;
-
-    }else{
-      r->strcmpfn = &strcmp;
     }
 
     // value was bound on creation as only right side const values are

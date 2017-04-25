@@ -290,6 +290,183 @@ static int stricmp(char const *a, char const *b)
   return -1;  // should never be reached
 }
 
+#define NEXT_CHAR(c, clen) ((c)++, (clen)--)
+#define COMPARE_CHAR(a, b) (ci ? tolower(a) == tolower(b) : a == b)
+
+static int like_match(const char *t, int tlen, const char *p, int plen, bool ci)
+{
+  /* This was adapted from like_match.c which is used for ILIKE/LIKE evaluation
+   * by postgres */
+
+  /* Fast path for match-everything pattern */
+  if (plen == 1 && *p == '%')
+    return 1;
+
+  /* Since this function recurses, it could be driven to stack overflow */
+  check_stack_depth();
+
+  /*
+   * In this loop, we advance by char when matching wildcards (and thus on
+   * recursive entry to this function we are properly char-synced). On other
+   * occasions it is safe to advance by byte, as the text and pattern will
+   * be in lockstep. This allows us to perform all comparisons between the
+   * text and pattern on a byte by byte basis, even for multi-byte
+   * encodings.
+   */
+  while (tlen > 0 && plen > 0) {
+    if (*p == '\\') {
+      /* Next pattern byte must match literally, whatever it is */
+      NEXT_CHAR(p, plen);
+      /* ... and there had better be one, per SQL standard */
+      if (plen <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
+                 errmsg("LIKE pattern must not end with escape character")));
+      if (!COMPARE_CHAR(*p, *t))
+        return 0;
+
+    } else if (*p == '%') {
+      char firstpat;
+      /*
+       * % processing is essentially a search for a text position at
+       * which the remainder of the text matches the remainder of the
+       * pattern, using a recursive call to check each potential match.
+       *
+       * If there are wildcards immediately following the %, we can skip
+       * over them first, using the idea that any sequence of N _'s and
+       * one or more %'s is equivalent to N _'s and one % (ie, it will
+       * match any sequence of at least N text characters).  In this way
+       * we will always run the recursive search loop using a pattern
+       * fragment that begins with a literal character-to-match, thereby
+       * not recursing more than we have to.
+       */
+      NEXT_CHAR(p, plen);
+
+      while (plen > 0) {
+        if (*p == '%')
+          NEXT_CHAR(p, plen);
+        else if (*p == '_') {
+
+          /* If not enough text left to match the pattern, ABORT */
+          if (tlen <= 0)
+            return -1;
+
+          NEXT_CHAR(t, tlen);
+          NEXT_CHAR(p, plen);
+
+        } else
+          break; /* Reached a non-wildcard pattern char */
+      }
+
+      /*
+       * If we're at end of pattern, match: we have a trailing % which
+       * matches any remaining text string.
+       */
+      if (plen <= 0)
+        return 1;
+
+      /*
+       * Otherwise, scan for a text position at which we can match the
+       * rest of the pattern.  The first remaining pattern char is known
+       * to be a regular or escaped literal character, so we can compare
+       * the first pattern byte to each text byte to avoid recursing
+       * more than we have to.  This fact also guarantees that we don't
+       * have to consider a match to the zero-length substring at the
+       * end of the text.
+       */
+      if (*p == '\\') {
+        if (plen < 2)
+          ereport(ERROR,
+                  (errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
+                   errmsg("LIKE pattern must not end with escape character")));
+        firstpat = p[1];
+
+      } else
+        firstpat = *p;
+
+
+
+      while (tlen > 0) {
+
+        if (COMPARE_CHAR(*t, firstpat)) {
+          int matched = like_match(t, tlen, p, plen, ci);
+          if (matched != 0)
+            return matched; /* TRUE or ABORT */
+        }
+
+        NEXT_CHAR(t, tlen);
+      }
+
+      /*
+       * End of text with no match, so no point in trying later places
+       * to start matching this pattern.
+       */
+      return -1;
+
+    } else if (*p == '_') {
+      /* _ matches any single character, and we know there is one */
+      NEXT_CHAR(t, tlen);
+      NEXT_CHAR(p, plen);
+      continue;
+
+    } else if (!COMPARE_CHAR(*p, *t)) {
+      /* non-wildcard pattern char fails to match text char */
+      return 0;
+    }
+
+    /*
+     * Pattern and text match, so advance.
+     *
+     */
+
+    NEXT_CHAR(t, tlen);
+    NEXT_CHAR(p, plen);
+  }
+
+  if (tlen > 0)
+    return 0; /* end of pattern, but not of text */
+
+  /*
+   * End of text, but perhaps not of pattern.  Match iff the remaining
+   * pattern can match a zero-length string, ie, it's zero or more %'s.
+   */
+  while (plen > 0 && *p == '%')
+    NEXT_CHAR(p, plen);
+  if (plen <= 0)
+    return 1;
+
+  /*
+   * End of text with no match, so no point in trying later places to start
+   * matching this pattern.
+   */
+  return -1;
+}
+
+
+/* case sensitive patern match */
+static int strlike(char const *a, char const *b)
+{
+  return (like_match(a, strlen(a), b, strlen(b), false) != 1);
+}
+
+/* case insensitive patern match */
+static int strilike(char const *a, char const *b)
+{
+  return (like_match(a, strlen(a), b, strlen(b), true) != 1);
+}
+
+/* inverted case sensitive patern match */
+static int notstrlike(char const *a, char const *b)
+{
+  return (like_match(a, strlen(a), b, strlen(b), false) == 1);
+}
+
+/* inverted case insensitive patern match */
+static int notstrilike(char const *a, char const *b)
+{
+  return (like_match(a, strlen(a), b, strlen(b), true) == 1);
+}
+
 /*
  * Convert a tsf_value_type to appropriate Postgres type
  */
@@ -1850,9 +2027,18 @@ static bool textCompareOperator(MulticornBaseQual *qual)
   if (strcmp(optString, "!=") == 0)
     return true;
 
-  //string icompare
   if (strcmp(optString, "~~*") == 0)
     return true;
+
+  if (strcmp(optString, "~~") == 0)
+    return true;
+
+  if (strcmp(optString, "!~~") == 0)
+    return true;
+
+  if (strcmp(optString, "!~~*") == 0)
+    return true;
+
 
   return false;
 }
@@ -2369,8 +2555,18 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
   case TypeString:
   case TypeStringArray: {
     StringRestriction* r = (StringRestriction*) restriction;
-    if(strcmp(qual->opname, "~~*") == 0){
-      r->strcmpfn = &stricmp;
+    if(strcmp(qual->opname, "~~") == 0){
+      r->strcmpfn = &strlike;
+
+    } else if (strcmp(qual->opname, "~~*") == 0) {
+      r->strcmpfn = &strilike;
+
+    } else if (strcmp(qual->opname, "!~~") == 0) {
+      r->strcmpfn = &notstrlike;
+
+    } else if (strcmp(qual->opname, "!~~*") == 0) {
+      r->strcmpfn = &notstrilike;
+
     }else{
       r->strcmpfn = &strcmp;
     }

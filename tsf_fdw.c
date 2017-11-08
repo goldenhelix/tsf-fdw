@@ -2525,7 +2525,7 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
       }
     }else if(qual->typeoid == TEXTOID){
       const char *str = TextDatumGetCString(value);
-      if (stricmp(str, "missing") || stricmp(str, "?")) {
+      if (stricmp(str, "missing") == 0 || stricmp(str, "?") == 0) {
         r->base.includeMissing = true;
       }
       r->includeTrue = (stricmp(str, "True") == 0);
@@ -2542,7 +2542,7 @@ static void bindRestrictionValue(RestrictionBase *restriction, tsf_field *field,
           continue;
         }
         char *str = TextDatumGetCString(itrValue);
-        if (stricmp(str, "missing") || stricmp(str, "?")) {
+        if (stricmp(str, "missing") == 0 || stricmp(str, "?") == 0) {
           r->base.includeMissing = true;
         }
         r->includeTrue = (stricmp(str, "True") == 0);
